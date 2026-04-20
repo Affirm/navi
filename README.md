@@ -1,12 +1,15 @@
 # Navi 🧭
+[![License](https://img.shields.io/badge/license-BSD--3--Clause-blue)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-macOS-lightgrey)](https://github.com/Affirm/navi)
+[![Claude Code](https://img.shields.io/badge/Claude%20Code-plugin-8A63D2)](https://docs.anthropic.com/en/docs/claude-code)
 
 **A floating macOS monitor for Claude Code sessions**
 
 See what every Claude Code session is doing across all your terminals — at a glance, from one floating window.
 
-[![License](https://img.shields.io/badge/license-BSD--3--Clause-blue)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-macOS-lightgrey)](https://github.com/Affirm/navi)
-[![Claude Code](https://img.shields.io/badge/Claude%20Code-plugin-8A63D2)](https://docs.anthropic.com/en/docs/claude-code)
+
+
+<img width="364" height="277" alt="Screenshot 2026-04-20 at 1 13 09 PM" src="https://github.com/user-attachments/assets/64e85feb-0caf-4927-8181-66bae2f75430" />
 
 ## Installation
 
