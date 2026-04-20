@@ -112,11 +112,11 @@ The app is a single-file SwiftUI app (`main.swift`) compiled with `swiftc`. No o
 
 Navi started inside Affirm's internal plugin catalog before it became this standalone repo, so not all contributors appear in this repo's git history. Thanks to:
 
-- [@KieranLitschel](https://github.com/KieranLitschel) — session status (Working / Idle) and session discovery, version upgrade banner
+- [@KieranLitschel](https://github.com/KieranLitschel) — improved session status (Working / Idle), session names, auto-dismiss, jump-to-terminal button,
 
-- [@manassarpatwar](https://github.com/manassarpatwar) — menu bar UI and floating-window mode, instant filesystem-watcher notifications, restart button and relaunch reliability, plus a long tail of stability fixes
+- [@manassarpatwar](https://github.com/manassarpatwar) — menu bar UI, instant filesystem-watcher notifications, plus a long tail of stability fixes
 
-- [@tarkatronic](https://github.com/tarkatronic) — suggested open-sourcing Navi and helped set up the public repo
+- [@tarkatronic](https://github.com/tarkatronic) — suggested open-sourcing Navi and helped with open-source setup
 
 ## License
 
