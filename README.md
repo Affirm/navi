@@ -11,12 +11,9 @@ A lightweight macOS monitor for [Claude Code](https://docs.anthropic.com/en/docs
 - **Terminal focus** — click "Jump to Terminal" to switch to the correct terminal tab for any session
 - **Multi-session overview** — monitor multiple concurrent Claude Code sessions at a glance
 - **Session names** — shows the session name (from `/rename`) instead of the project folder
-- **Always-on-top** — floats above other windows so you never miss an event
 - **Menu bar icon** — toggle the window from the menu bar; icon changes when permissions are pending
 - **Auto-launch** — the app builds and launches itself the first time a hook fires
 - **Per-event sounds** — configurable alert sounds for permission requests, completions, and notifications
-- **Configurable font size** — scale text from 80% to 140%
-- **Remembers position** — window reopens where you left it
 
 ## Requirements
 
