@@ -111,6 +111,52 @@ open Navi.app        # Launch
 
 The app is a single-file SwiftUI app (`main.swift`) compiled with `swiftc`. No other dependencies. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the feature-flag system and guidance on adding experimental features.
 
+## Troubleshooting
+
+### `failed to build module 'SwiftUI'` / `this SDK is not supported by the compiler`
+
+```
+failed to build module 'SwiftUI', this SDK is not supported by the compiler
+(the SDK is built with 'Apple Swift version 6.0.3 effective-5.10 (swiftlang-6.0.3.1.5),
+while this compiler is 'Apple Swift version 6.0.3 effective-5.10 (swiftlang-6.0.3.1.10...)'
+```
+
+This is not a Navi bug — it means your Xcode Command Line Tools install is inconsistent: the SDK (`.swiftmodule` files for SwiftUI, AppKit, etc.) was produced by a sibling build of the Swift compiler than the one `swiftc` reports. That usually happens after a partial macOS/CLT update, or when Xcode.app and CLT end up on different update cycles.
+
+**Check what's active:**
+
+```bash
+xcode-select -p
+xcrun swift --version
+xcrun --show-sdk-version
+xcrun --show-sdk-path
+```
+
+`build.sh` prints the same information at the top of every build, so you can read it from the build output too.
+
+**Fix in order of escalation:**
+
+1. **Re-align the developer directory** (30 seconds). If you have Xcode.app installed, point to it; otherwise point to CLT:
+
+   ```bash
+   # With Xcode.app installed
+   sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+   # CLT only
+   sudo xcode-select -s /Library/Developer/CommandLineTools
+   ```
+
+2. **Reinstall Command Line Tools** (5 minutes). Most reliable fix when you don't have Xcode.app, or when alignment didn't help:
+
+   ```bash
+   sudo rm -rf /Library/Developer/CommandLineTools
+   xcode-select --install
+   ```
+
+3. **Update macOS + Xcode/CLT to current.** If the versions have drifted far apart across major releases, install all pending updates in System Settings → General → Software Update, then reinstall CLT.
+
+After any of these, run `bash build.sh` again.
+
 ## Contributors
 
 Navi started inside Affirm's internal plugin catalog before it became this standalone repo, so not all contributors appear in this repo's git history. Thanks to:

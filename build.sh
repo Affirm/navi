@@ -16,12 +16,26 @@ if [ -x "$BINARY" ] && [ -f "$BUILT_VERSION_FILE" ] && [ "$(cat "$BUILT_VERSION_
     exit 0
 fi
 
+trap 'status=$?
+      if [ "$status" -ne 0 ]; then
+        echo "" >&2
+        echo "Build failed. If you see a SwiftUI \"SDK is not supported by the compiler\" error," >&2
+        echo "your Xcode Command Line Tools install is likely inconsistent." >&2
+        echo "See README -> Troubleshooting." >&2
+      fi' EXIT
+
 echo "Building Navi..." >&2
+echo "== Build environment ==" >&2
+echo "macOS:     $(sw_vers -productVersion) ($(uname -m))" >&2
+echo "Developer: $(xcode-select -p 2>/dev/null || echo '(not configured)')" >&2
+echo "Swift:     $(xcrun -sdk macosx swift --version 2>&1 | head -1)" >&2
+echo "SDK:       $(xcrun -sdk macosx --show-sdk-version 2>/dev/null) at $(xcrun -sdk macosx --show-sdk-path 2>/dev/null)" >&2
+echo "=======================" >&2
 
 mkdir -p "$MACOS"
 cp "$DIR/Info.plist" "$CONTENTS/Info.plist"
 
-swiftc \
+xcrun -sdk macosx swiftc \
     -parse-as-library \
     -swift-version 5 \
     -O \
