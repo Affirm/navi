@@ -108,6 +108,16 @@ open Navi.app        # Launch
 
 The app is a single-file SwiftUI app (`main.swift`) compiled with `swiftc`. No other dependencies. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the feature-flag system and guidance on adding experimental features.
 
+## Contributors
+
+Navi started inside Affirm's internal plugin catalog before it became this standalone repo, so not all contributors appear in this repo's git history. Thanks to:
+
+- [@KieranLitschel](https://github.com/KieranLitschel) — session status (Working / Idle) and session discovery, version upgrade banner
+
+- [@manassarpatwar](https://github.com/manassarpatwar) — menu bar UI and floating-window mode, instant filesystem-watcher notifications, restart button and relaunch reliability, plus a long tail of stability fixes
+
+- [@tarkatronic](https://github.com/tarkatronic) — suggested open-sourcing Navi and helped set up the public repo
+
 ## License
 
 BSD 3-Clause — see [LICENSE](LICENSE).
