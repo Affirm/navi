@@ -58,9 +58,36 @@ Then register the hooks from `hooks/hooks.json` in your `~/.claude/settings.json
 
 ## How It Works
 
-Claude Code hooks (`PermissionRequest`, `Stop`, `Notification`, etc.) write event files to `/tmp/navi/events/`. The Navi app watches that directory and renders events in a SwiftUI floating window. For permission requests, `hook.sh` writes the event and polls for a response file; when you click Approve/Deny, Navi writes the response and the hook returns the decision to Claude Code. If no response comes within 120 seconds, it falls back to the terminal prompt.
+```
+Claude Code session
+  │
+  ├── UserPromptSubmit ──→ userpromptsubmit.sh ──→ writes working signal ──→ /tmp/navi/events/
+  ├── PreToolUse ────────→ pretooluse.sh ────────→ captures tool_use_id ──→ /tmp/navi/pretooluse/
+  ├── PermissionRequest ─→ hook.sh → parse_event.py → event JSON ─────────→ /tmp/navi/events/
+  ├── PostToolUse ───────→ hook.sh → parse_event.py → resolve signal ─────→ /tmp/navi/events/
+  ├── Stop ──────────────→ hook.sh → parse_event.py → event JSON ─────────→ /tmp/navi/events/
+  ├── StopFailure ───────→ hook.sh → parse_event.py → event JSON ─────────→ /tmp/navi/events/
+  ├── Notification ──────→ hook.sh → parse_event.py → event JSON ─────────→ /tmp/navi/events/
+  └── PostToolUseFailure → hook.sh → parse_event.py → resolve signal ─────→ /tmp/navi/events/
 
-For architecture details, see [`CLAUDE.md`](CLAUDE.md).
+~/.claude/sessions/*.json ──→ Navi session discovery (PID liveness + TTY lookup)
+
+Navi.app
+  ├── polls /tmp/navi/events/ (instant via kqueue watcher + fallback timer)
+  ├── discovers sessions from ~/.claude/sessions/
+  ├── tracks Working/Idle/Dead status per session
+  └── displays events in SwiftUI floating window + menu bar popover
+        │
+        User clicks Approve/Deny
+        │
+        writes response to /tmp/navi/responses/<event-id>
+        │
+        hook.sh reads response, returns decision to Claude Code
+```
+
+For permission requests, `hook.sh` writes an event file and polls for a response file. When you click Approve/Deny, Navi writes the response, the hook picks it up and returns the decision to Claude Code. If no response comes within 120 seconds, it falls back to the terminal prompt.
+
+For architecture details and guidance on extending Navi, see [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## Uninstall
 
@@ -79,7 +106,7 @@ bash build.sh        # Compiles main.swift into Navi.app
 open Navi.app        # Launch
 ```
 
-The app is a single-file SwiftUI app (`main.swift`) compiled with `swiftc`. No other dependencies. See [`CLAUDE.md`](CLAUDE.md) for the feature-flag system and guidance on adding experimental features.
+The app is a single-file SwiftUI app (`main.swift`) compiled with `swiftc`. No other dependencies. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the feature-flag system and guidance on adding experimental features.
 
 ## License
 
