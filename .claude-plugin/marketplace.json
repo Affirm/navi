@@ -1,0 +1,18 @@
+{
+  "name": "navi",
+  "owner": {
+    "name": "Affirm"
+  },
+  "metadata": {
+    "description": "Claude Code plugin marketplace for Navi — a floating macOS session monitor."
+  },
+  "plugins": [
+    {
+      "name": "navi",
+      "source": "./",
+      "description": "Floating macOS window that monitors Claude Code sessions with Working/Idle status, inline permission approve/deny, session discovery, per-event sounds, and menu bar icon.",
+      "category": "productivity",
+      "keywords": ["claude-code", "macos", "monitor", "permissions", "swift"]
+    }
+  ]
+}
