@@ -45,15 +45,67 @@ private func relativeTime(from date: Date, to now: Date) -> String {
 
 // MARK: - Terminal Focus
 
-/// Activate the terminal tab that owns `tty` (e.g. "/dev/ttys003").
-func focusTerminal(tty: String) {
-    guard !tty.isEmpty else { return }
-    guard tty.range(of: #"^/dev/tty[a-zA-Z0-9]+$"#, options: .regularExpression) != nil else {
-        naviLog("focusTerminal: invalid tty format: %@", tty)
-        return
+/// Run a shell command (via /bin/sh -c with a PATH that includes common Homebrew
+/// locations) and return stdout trimmed, or nil on failure / empty output.
+private func runShell(_ script: String) -> String? {
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: "/bin/sh")
+    proc.arguments = ["-c", script]
+    var env = ProcessInfo.processInfo.environment
+    env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+    proc.environment = env
+    let pipe = Pipe()
+    proc.standardOutput = pipe
+    proc.standardError = FileHandle.nullDevice
+    do {
+        try proc.run()
+        proc.waitUntilExit()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let out = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return out.isEmpty ? nil : out
+    } catch {
+        return nil
     }
-    naviLog("focusTerminal: looking for tty=%@", tty)
+}
 
+/// If `paneTTY` matches a tmux pane, return the tmux switch target
+/// ("session:window.pane") and the TTY of a client we can use to reach it
+/// (the TTY of the host terminal emulator). Prefers a client already attached
+/// to the target session; otherwise falls back to any attached client, since
+/// `tmux switch-client -c X -t session:...` moves X to the target session
+/// even if X is currently attached to a different session. Returns nil when
+/// tmux isn't installed, the TTY isn't a pane, or no client is attached at all.
+private func tmuxTargetForPane(_ paneTTY: String) -> (target: String, clientTTY: String)? {
+    guard let panes = runShell("tmux list-panes -a -F '#{pane_tty}|#{session_name}|#{window_index}.#{pane_index}' 2>/dev/null") else {
+        return nil
+    }
+    var session: String?
+    var target: String?
+    for line in panes.split(separator: "\n") {
+        let parts = line.split(separator: "|", maxSplits: 2, omittingEmptySubsequences: false)
+        guard parts.count == 3, String(parts[0]) == paneTTY else { continue }
+        session = String(parts[1])
+        target = "\(parts[1]):\(parts[2])"
+        break
+    }
+    guard let session = session, let target = target else { return nil }
+    let escapedSession = session.replacingOccurrences(of: "'", with: "'\\''")
+    if let attached = runShell("tmux list-clients -t '\(escapedSession)' -F '#{client_tty}' 2>/dev/null"),
+       let clientTTY = attached.split(separator: "\n").first.map(String.init),
+       !clientTTY.isEmpty {
+        return (target, clientTTY)
+    }
+    guard let anyClients = runShell("tmux list-clients -F '#{client_tty}' 2>/dev/null"),
+          let clientTTY = anyClients.split(separator: "\n").first.map(String.init),
+          !clientTTY.isEmpty
+    else { return nil }
+    return (target, clientTTY)
+}
+
+/// Activate the terminal emulator tab/session that owns `tty` via AppleScript
+/// (iTerm2 or Terminal.app).
+private func activateTerminalApp(tty: String) {
     let iTermScript = """
     tell application "System Events"
         if not (exists process "iTerm2") then return false
@@ -107,19 +159,42 @@ func focusTerminal(tty: String) {
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
             let out = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             if out == "true" {
-                naviLog("focusTerminal: activated tty=%@", tty)
+                naviLog("activateTerminalApp: activated tty=%@", tty)
                 return
             }
         } catch {
-            naviLog("focusTerminal: osascript error: %@", error.localizedDescription)
+            naviLog("activateTerminalApp: osascript error: %@", error.localizedDescription)
         }
     }
-    naviLog("focusTerminal: no terminal found for tty=%@", tty)
+    naviLog("activateTerminalApp: no terminal found for tty=%@", tty)
+}
+
+/// Activate the terminal owning `tty`. If the TTY is a tmux pane, first switch
+/// the attached tmux client to that pane, then focus the terminal emulator
+/// that hosts the client.
+func focusTerminal(tty: String) {
+    guard !tty.isEmpty else { return }
+    guard tty.range(of: #"^/dev/tty[a-zA-Z0-9]+$"#, options: .regularExpression) != nil else {
+        naviLog("focusTerminal: invalid tty format: %@", tty)
+        return
+    }
+    naviLog("focusTerminal: looking for tty=%@", tty)
+
+    if let t = tmuxTargetForPane(tty) {
+        naviLog("focusTerminal: tmux pane → %@ via client %@", t.target, t.clientTTY)
+        let escTarget = t.target.replacingOccurrences(of: "'", with: "'\\''")
+        let escClient = t.clientTTY.replacingOccurrences(of: "'", with: "'\\''")
+        _ = runShell("tmux switch-client -c '\(escClient)' -t '\(escTarget)' 2>/dev/null")
+        activateTerminalApp(tty: t.clientTTY)
+        return
+    }
+
+    activateTerminalApp(tty: tty)
 }
 
 // MARK: - Version
 
-let naviCurrentVersion = "1.1.3"
+let naviCurrentVersion = "1.1.5"
 
 // MARK: - Model
 
@@ -194,38 +269,38 @@ class EventMonitor: ObservableObject {
 
     init() {
         let fm = FileManager.default
-        try? fm.createDirectory(atPath: eventsDir, withIntermediateDirectories: true)
-        try? fm.createDirectory(atPath: responsesDir, withIntermediateDirectories: true)
+        let ownerOnly: [FileAttributeKey: Any] = [.posixPermissions: 0o700]
+        try? fm.createDirectory(atPath: eventsDir, withIntermediateDirectories: true, attributes: ownerOnly)
+        try? fm.createDirectory(atPath: responsesDir, withIntermediateDirectories: true, attributes: ownerOnly)
+        // Self-heal perms on pre-existing dirs so event JSON (Confidential tool
+        // input) and response files (trusted permission-decision channel) stay
+        // owner-readable only.
+        try? fm.setAttributes(ownerOnly, ofItemAtPath: "/tmp/navi")
+        try? fm.setAttributes(ownerOnly, ofItemAtPath: eventsDir)
+        try? fm.setAttributes(ownerOnly, ofItemAtPath: responsesDir)
         // Clean stale files from previous runs
         cleanDirectory(eventsDir)
         cleanDirectory(responsesDir)
         try? fm.removeItem(atPath: "/tmp/navi/needs-restart")
 
         // Discover already-running Claude sessions from ~/.claude/sessions/
-        if UserDefaults.standard.bool(forKey: "NaviExp.SessionStatus") {
-            discoverSessions()
-        }
-
-        let instantNotify = UserDefaults.standard.object(forKey: "NaviExp.InstantNotify") == nil
-            || UserDefaults.standard.bool(forKey: "NaviExp.InstantNotify")
+        discoverSessions()
 
         // Watch the events directory for new files — triggers poll() instantly
         // via kqueue so events appear with near-zero latency.
-        if instantNotify {
-            let fd = open(eventsDir, O_EVTONLY)
-            if fd >= 0 {
-                let source = DispatchSource.makeFileSystemObjectSource(
-                    fileDescriptor: fd, eventMask: .write, queue: .main)
-                source.setEventHandler { [weak self] in self?.poll() }
-                source.setCancelHandler { close(fd) }
-                source.resume()
-                dirSource = source
-            }
+        let fd = open(eventsDir, O_EVTONLY)
+        if fd >= 0 {
+            let source = DispatchSource.makeFileSystemObjectSource(
+                fileDescriptor: fd, eventMask: .write, queue: .main)
+            source.setEventHandler { [weak self] in self?.poll() }
+            source.setCancelHandler { close(fd) }
+            source.resume()
+            dirSource = source
         }
 
-        // Timer: fallback for cleanup when instant notify is on, primary poll otherwise.
-        let interval: TimeInterval = instantNotify ? 1.0 : 0.3
-        let t = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
+        // Timer fallback for cleanup passes (event ingestion is driven by the
+        // kqueue source above).
+        let t = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.poll()
         }
         RunLoop.main.add(t, forMode: .common)
@@ -257,8 +332,7 @@ class EventMonitor: ObservableObject {
             // Handle resolve signals from PostToolUse and cancel signals from
             // hook.sh EXIT trap (experimental auto-dismiss feature).
             if file.hasPrefix("resolve-") || file.hasPrefix("cancel-") {
-                if UserDefaults.standard.bool(forKey: "NaviExp.AutoDismiss"),
-                   let data = fm.contents(atPath: path),
+                if let data = fm.contents(atPath: path),
                    let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                     let tuid = dict["tool_use_id"] as? String
                     let eid = dict["id"] as? String
@@ -315,13 +389,19 @@ class EventMonitor: ObservableObject {
             )
             DispatchQueue.main.async {
                 self.updateSession(for: event)
-                // When auto-dismiss is enabled and a Stop event arrives,
-                // dismiss all pending permissions for this session (the turn
-                // ended, so any unresolved permission was denied/interrupted).
-                // When auto-dismiss is off, use the original 30s age threshold.
+                // Skip Notification events for sessions that already have a
+                // pending Permission — the permission itself signals "needs
+                // attention", so the notification would be redundant.
+                if event.type == "notification",
+                   self.events.contains(where: { $0.sessionID == event.sessionID && $0.isPending }) {
+                    return
+                }
+                // When a Stop event arrives, immediately dismiss pending
+                // permissions for this session — the turn ended, so any
+                // unresolved permission was denied/interrupted. Other
+                // non-permission events use a 30s age threshold.
                 if event.type != "permission" {
-                    let autoDismiss = UserDefaults.standard.bool(forKey: "NaviExp.AutoDismiss")
-                    let minAge: TimeInterval = (autoDismiss && event.type == "stop") ? 0 : 30
+                    let minAge: TimeInterval = event.type == "stop" ? 0 : 30
                     for i in self.events.indices where self.events[i].sessionID == event.sessionID && self.events[i].isPending && event.timestamp.timeIntervalSince(self.events[i].timestamp) > minAge {
                         self.events[i].resolved = true
                         self.events[i].response = "dismissed"
@@ -353,12 +433,9 @@ class EventMonitor: ObservableObject {
                 if event.resolved { return now.timeIntervalSince(event.timestamp) > 10 }
                 return now.timeIntervalSince(event.timestamp) > 60
             }
-            let statusEnabled = UserDefaults.standard.bool(forKey: "NaviExp.SessionStatus")
             // Discover new sessions BEFORE applying working signals so that
             // a brand-new session's first working signal isn't dropped.
-            if statusEnabled {
-                self.discoverSessions()
-            }
+            self.discoverSessions()
             // Apply working signals AFTER regular events and discovery so
             // they always win over stale Stop events.
             for sid in workingSessions {
@@ -372,10 +449,7 @@ class EventMonitor: ObservableObject {
                     self.events[i].response = "dismissed"
                 }
             }
-            self.sessions = self.sessions.filter { (_, info) in
-                if statusEnabled { return info.isAlive }
-                return now.timeIntervalSince(info.lastActivity) < 300
-            }
+            self.sessions = self.sessions.filter { (_, info) in info.isAlive }
 
             // Check if build.sh rebuilt a newer version while we're running
             let restartMarker = "/tmp/navi/needs-restart"
@@ -514,12 +588,8 @@ struct SessionGroup: Identifiable {
 
     var status: SessionStatus {
         if hasPending { return .needsAttention }
-        let aliveEnabled = UserDefaults.standard.bool(forKey: "NaviExp.SessionStatus")
-        if aliveEnabled && info.isAlive {
-            if info.lastEventType == "working" {
-                return .working
-            }
-            return .waitingForInput
+        if info.isAlive {
+            return info.lastEventType == "working" ? .working : .waitingForInput
         }
         return .idle
     }
@@ -580,20 +650,6 @@ class FloatingWindowManager: ObservableObject {
         }
     }
 
-    @Published var terminalFocusEnabled: Bool {
-        didSet {
-            UserDefaults.standard.set(terminalFocusEnabled, forKey: "NaviExp.TerminalFocus")
-            Self.setFeatureFlag("terminal-focus", enabled: terminalFocusEnabled)
-        }
-    }
-
-    @Published var autoDismissEnabled: Bool {
-        didSet {
-            UserDefaults.standard.set(autoDismissEnabled, forKey: "NaviExp.AutoDismiss")
-            Self.setFeatureFlag("auto-dismiss", enabled: autoDismissEnabled)
-        }
-    }
-
     @Published var sessionNamesEnabled: Bool {
         didSet {
             UserDefaults.standard.set(sessionNamesEnabled, forKey: "NaviExp.SessionNames")
@@ -601,24 +657,10 @@ class FloatingWindowManager: ObservableObject {
         }
     }
 
-    @Published var instantNotifyEnabled: Bool {
+    @Published var permissionDetailsEnabled: Bool {
         didSet {
-            UserDefaults.standard.set(instantNotifyEnabled, forKey: "NaviExp.InstantNotify")
-            Self.setFeatureFlag("instant-notify", enabled: instantNotifyEnabled)
-        }
-    }
-
-    @Published var sessionStatusEnabled: Bool {
-        didSet {
-            UserDefaults.standard.set(sessionStatusEnabled, forKey: "NaviExp.SessionStatus")
-            Self.setFeatureFlag("session-status", enabled: sessionStatusEnabled)
-        }
-    }
-
-    @Published var detailedPermissionsEnabled: Bool {
-        didSet {
-            UserDefaults.standard.set(detailedPermissionsEnabled, forKey: "NaviExp.DetailedPermissions")
-            Self.setFeatureFlag("detailed-permissions", enabled: detailedPermissionsEnabled)
+            UserDefaults.standard.set(permissionDetailsEnabled, forKey: "NaviExp.PermissionDetails")
+            Self.setFeatureFlag("permission-details", enabled: permissionDetailsEnabled)
         }
     }
 
@@ -670,14 +712,19 @@ class FloatingWindowManager: ObservableObject {
 
     private func syncFeatureFlags() {
         try? FileManager.default.createDirectory(
-            atPath: Self.featuresDir, withIntermediateDirectories: true)
+            atPath: Self.featuresDir, withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700])
+        try? FileManager.default.setAttributes(
+            [.posixPermissions: 0o700], ofItemAtPath: Self.featuresDir)
         Self.setFeatureFlag("menu-bar", enabled: menuBarEnabled)
-        Self.setFeatureFlag("terminal-focus", enabled: terminalFocusEnabled)
-        Self.setFeatureFlag("auto-dismiss", enabled: autoDismissEnabled)
         Self.setFeatureFlag("session-names", enabled: sessionNamesEnabled)
-        Self.setFeatureFlag("instant-notify", enabled: instantNotifyEnabled)
-        Self.setFeatureFlag("session-status", enabled: sessionStatusEnabled)
-        Self.setFeatureFlag("detailed-permissions", enabled: detailedPermissionsEnabled)
+        Self.setFeatureFlag("permission-details", enabled: permissionDetailsEnabled)
+        // Core features — always enabled. Flag files written so hooks that
+        // still gate on `/tmp/navi/features/<name>` continue to work.
+        Self.setFeatureFlag("terminal-focus", enabled: true)
+        Self.setFeatureFlag("auto-dismiss", enabled: true)
+        Self.setFeatureFlag("instant-notify", enabled: true)
+        Self.setFeatureFlag("session-status", enabled: true)
     }
 
     /// Relaunch Navi by spawning a detached shell that reopens the app bundle
@@ -708,37 +755,32 @@ class FloatingWindowManager: ObservableObject {
         } else {
             menuBarEnabled = UserDefaults.standard.bool(forKey: "NaviExp.MenuBar")
         }
-        if UserDefaults.standard.object(forKey: "NaviExp.TerminalFocus") == nil {
-            UserDefaults.standard.set(true, forKey: "NaviExp.TerminalFocus")
-            terminalFocusEnabled = true
-        } else {
-            terminalFocusEnabled = UserDefaults.standard.bool(forKey: "NaviExp.TerminalFocus")
-        }
-        if UserDefaults.standard.object(forKey: "NaviExp.AutoDismiss") == nil {
-            UserDefaults.standard.set(true, forKey: "NaviExp.AutoDismiss")
-            autoDismissEnabled = true
-        } else {
-            autoDismissEnabled = UserDefaults.standard.bool(forKey: "NaviExp.AutoDismiss")
-        }
         if UserDefaults.standard.object(forKey: "NaviExp.SessionNames") == nil {
             UserDefaults.standard.set(true, forKey: "NaviExp.SessionNames")
             sessionNamesEnabled = true
         } else {
             sessionNamesEnabled = UserDefaults.standard.bool(forKey: "NaviExp.SessionNames")
         }
-        if UserDefaults.standard.object(forKey: "NaviExp.InstantNotify") == nil {
-            UserDefaults.standard.set(true, forKey: "NaviExp.InstantNotify")
-            instantNotifyEnabled = true
+        if UserDefaults.standard.object(forKey: "NaviExp.PermissionDetails") == nil {
+            UserDefaults.standard.set(true, forKey: "NaviExp.PermissionDetails")
+            permissionDetailsEnabled = true
         } else {
-            instantNotifyEnabled = UserDefaults.standard.bool(forKey: "NaviExp.InstantNotify")
+            permissionDetailsEnabled = UserDefaults.standard.bool(forKey: "NaviExp.PermissionDetails")
         }
-        if UserDefaults.standard.object(forKey: "NaviExp.SessionStatus") == nil {
-            UserDefaults.standard.set(true, forKey: "NaviExp.SessionStatus")
-            sessionStatusEnabled = true
-        } else {
-            sessionStatusEnabled = UserDefaults.standard.bool(forKey: "NaviExp.SessionStatus")
-        }
-        detailedPermissionsEnabled = UserDefaults.standard.bool(forKey: "NaviExp.DetailedPermissions")
+        // Clean up legacy feature flag files from removed options. Manual resize
+        // became permanent in 1.1.x — no longer a toggle.
+        try? FileManager.default.removeItem(atPath: "\(Self.featuresDir)/detailed-permissions")
+        try? FileManager.default.removeItem(atPath: "\(Self.featuresDir)/expanded-permissions")
+        try? FileManager.default.removeItem(atPath: "\(Self.featuresDir)/manual-resize")
+        UserDefaults.standard.removeObject(forKey: "NaviExp.DetailedPermissions")
+        UserDefaults.standard.removeObject(forKey: "NaviExp.ExpandedPermissions")
+        UserDefaults.standard.removeObject(forKey: "NaviExp.ManualResize")
+        // Terminal focus / auto-dismiss / instant notify / session status graduated
+        // to always-on core behavior — clean up their old toggle keys.
+        UserDefaults.standard.removeObject(forKey: "NaviExp.TerminalFocus")
+        UserDefaults.standard.removeObject(forKey: "NaviExp.AutoDismiss")
+        UserDefaults.standard.removeObject(forKey: "NaviExp.InstantNotify")
+        UserDefaults.standard.removeObject(forKey: "NaviExp.SessionStatus")
 
         // Show a session restart hint after a plugin version upgrade
         let lastVersion = UserDefaults.standard.string(forKey: "NaviLastVersion") ?? ""
@@ -819,8 +861,7 @@ class MenuBarManager: NSObject, ObservableObject {
         // Reuse existing popover, create once
         if popover == nil {
             let pop = NSPopover()
-            let width: CGFloat = floatingManager.detailedPermissionsEnabled ? 520 : 360
-            pop.contentSize = NSSize(width: width, height: 500)
+            pop.contentSize = NSSize(width: 360, height: 500)
             pop.behavior = .transient
             pop.animates = true
             pop.contentViewController = NSHostingController(
@@ -885,45 +926,66 @@ struct ContentView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            controlsBar
-            if monitor.needsBinaryRestart {
-                binaryRestartBanner
-            }
-            if floatingManager.showSessionRestartHint {
-                sessionRestartHint
-            }
-            Divider()
-            if monitor.sessions.isEmpty {
-                emptyState
-            } else {
-                sessionList
-            }
-        }
-        .frame(width: floatingManager.detailedPermissionsEnabled ? 520 : 360)
-        .overlay(
-            Group {
-                if isFloatingWindow {
-                    GeometryReader { geo in
-                        Color.clear.preference(key: ViewHeightKey.self, value: geo.size.height)
-                    }
+            VStack(spacing: 0) {
+                controlsBar
+                if monitor.needsBinaryRestart {
+                    binaryRestartBanner
+                }
+                if floatingManager.showSessionRestartHint {
+                    sessionRestartHint
+                }
+                Divider()
+                if monitor.sessions.isEmpty {
+                    emptyState
+                } else {
+                    sessionList
                 }
             }
-        )
+            .frame(minWidth: 360, idealWidth: 360, maxWidth: .infinity)
+            .overlay(
+                Group {
+                    if isFloatingWindow {
+                        GeometryReader { geo in
+                            Color.clear.preference(key: ViewHeightKey.self, value: geo.size.height)
+                        }
+                    }
+                }
+            )
+
+            Spacer(minLength: 0)
+        }
         .onPreferenceChange(ViewHeightKey.self) { height in
             if isFloatingWindow { resizeWindow(to: height + 28) }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(.ultraThinMaterial)
         .background(Group { if isFloatingWindow { WindowAccessor(floatingManager: floatingManager) } })
     }
 
+    // Auto-resize respects two floors:
+    //   1. The user's last drag (so a user-widened window doesn't shrink back).
+    //   2. The current window height, while any events are in the monitor.
+    //      This blocks the shrink that races with popover dismissal / section
+    //      auto-collapse, which is where the visual jitter comes from. Once all
+    //      events clear (monitor.events is empty), the window shrinks freely
+    //      back to the baseline.
     private func resizeWindow(to targetHeight: CGFloat) {
         DispatchQueue.main.async {
             guard let window = NaviWindow.ref else { return }
             if targetHeight < 1 { return }
+            let userMinW = CGFloat(UserDefaults.standard.double(forKey: "NaviUserMinWidth"))
+            let userMinH = CGFloat(UserDefaults.standard.double(forKey: "NaviUserMinHeight"))
+            let currentH = window.frame.height
+            let targetW = max(360, userMinW)
+            var targetH = max(targetHeight, userMinH)
+            if !self.monitor.events.isEmpty && targetH < currentH {
+                targetH = currentH
+            }
             let top = window.frame.maxY
             var frame = window.frame
-            frame.size.height = targetHeight
-            frame.origin.y = top - targetHeight
+            frame.size.height = targetH
+            frame.size.width = targetW
+            frame.origin.y = top - targetH
             window.setFrame(frame, display: true, animate: false)
         }
     }
@@ -1105,9 +1167,6 @@ struct ContentView: View {
                 .font(.system(size: 9))
                 .foregroundStyle(.secondary)
 
-            experimentalRow("Jump to terminal", subtitle: "Adds a \"Jump to Terminal\" button on each session",
-                isOn: Binding(get: { floatingManager.terminalFocusEnabled }, set: { floatingManager.terminalFocusEnabled = $0 }))
-
             experimentalRow("Menu bar icon", subtitle: "Adds a menu bar icon for Navi.",
                 isOn: Binding(get: { floatingManager.menuBarEnabled }, set: { floatingManager.menuBarEnabled = $0 }))
 
@@ -1116,25 +1175,11 @@ struct ContentView: View {
                     isOn: Binding(get: { floatingManager.isFloating }, set: { floatingManager.isFloating = $0 }), indent: true)
             }
 
-            experimentalRow("Auto-dismiss", subtitle: "Dismiss permissions when approved in the terminal. Shows \"Respond in terminal\" after the hook times out.",
-                isOn: Binding(get: { floatingManager.autoDismissEnabled }, set: { floatingManager.autoDismissEnabled = $0 }))
-
             experimentalRow("Session names", subtitle: "Show session name (from /rename) instead of project folder",
                 isOn: Binding(get: { floatingManager.sessionNamesEnabled }, set: { floatingManager.sessionNamesEnabled = $0 }))
 
-            experimentalRow("Session status", subtitle: "Show Working/Idle status per session. Dead sessions auto-clean immediately.",
-                isOn: Binding(get: { floatingManager.sessionStatusEnabled }, set: { floatingManager.sessionStatusEnabled = $0 }))
-
-            experimentalRow("Instant notifications", subtitle: "Use filesystem watcher instead of polling for near-instant event detection",
-                isOn: Binding(get: { floatingManager.instantNotifyEnabled }, set: { floatingManager.instantNotifyEnabled = $0 }),
-                requiresRestart: true)
-
-            experimentalRow("Detailed permissions", subtitle: "Show the full tool input for permission requests. Widens the Navi window.",
-                isOn: Binding(get: { floatingManager.detailedPermissionsEnabled }, set: { floatingManager.detailedPermissionsEnabled = $0 }))
-
-            if floatingManager.pendingRestart {
-                restartBanner
-            }
+            experimentalRow("Permission details", subtitle: "Show a \"Show details\" button on each permission request that opens a popover with the full tool input.",
+                isOn: Binding(get: { floatingManager.permissionDetailsEnabled }, set: { floatingManager.permissionDetailsEnabled = $0 }))
 
             Spacer()
         }
@@ -1316,7 +1361,7 @@ struct SessionSection: View {
                 }
                 .buttonStyle(.plain)
 
-                if floatingManager.terminalFocusEnabled && !group.info.tty.isEmpty {
+                if !group.info.tty.isEmpty {
                     Button { focusTerminal(tty: group.info.tty) } label: {
                         Image(systemName: "terminal.fill")
                             .font(.system(size: 10 * s, weight: .bold))
@@ -1373,7 +1418,8 @@ struct EventRow: View {
     let event: NaviEvent
     @ObservedObject var monitor: EventMonitor
     @AppStorage("NaviFontScale") private var s: Double = 1.0
-    @AppStorage("NaviExp.DetailedPermissions") private var detailedPermissions: Bool = false
+    @State private var showingDetails = false
+    @AppStorage("NaviExp.PermissionDetails") private var permissionDetailsEnabled: Bool = true
 
     private var icon: String {
         switch event.type {
@@ -1405,22 +1451,26 @@ struct EventRow: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(event.title)
                         .font(.system(size: 13 * s, weight: .semibold))
-                    if detailedPermissions && event.type == "permission" {
-                        ScrollView {
-                            Text(event.body)
-                                .font(.system(size: 12 * s, design: .monospaced))
-                                .foregroundStyle(.secondary)
-                                .textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                        .frame(maxHeight: 300)
-                    } else {
+                    Text(event.body)
+                        .font(.system(size: 12 * s, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(4)
+                        .textSelection(.enabled)
+                }
+                // Anchor the popover to this always-rendered VStack. Attaching
+                // it to the Show-details button causes SwiftUI to re-anchor
+                // (or orphan) the popover when the button's parent row
+                // switches from permissionButtons to the resolved row, which
+                // produced a visible drop/offset during the transition.
+                .popover(isPresented: $showingDetails, arrowEdge: .leading) {
+                    ScrollView {
                         Text(event.body)
                             .font(.system(size: 12 * s, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(4)
                             .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(12)
                     }
+                    .frame(width: 500, height: 400)
                 }
 
                 Spacer(minLength: 4)
@@ -1441,8 +1491,7 @@ struct EventRow: View {
             }
 
             if event.isPending {
-                if UserDefaults.standard.bool(forKey: "NaviExp.AutoDismiss"),
-                   let expires = event.expires {
+                if let expires = event.expires {
                     TimelineView(.periodic(from: .now, by: 1)) { context in
                         if context.date < expires {
                             permissionButtons
@@ -1457,6 +1506,7 @@ struct EventRow: View {
 
             if event.resolved, let response = event.response {
                 HStack {
+                    showDetailsButton
                     Spacer()
                     Label(
                         response == "dismissed" ? "Handled in Terminal" : response.capitalized,
@@ -1478,14 +1528,41 @@ struct EventRow: View {
         .animation(.easeInOut(duration: 0.2), value: event.resolved)
     }
 
+    @ViewBuilder private var showDetailsButton: some View {
+        if event.type == "permission" && permissionDetailsEnabled {
+            Button {
+                showingDetails = true
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "arrow.left")
+                        .font(.system(size: 9 * s, weight: .bold))
+                    Text("Show details")
+                        .font(.system(size: 10 * s, weight: .medium))
+                }
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+        }
+    }
+
     private var permissionButtons: some View {
         HStack(spacing: 8) {
+            showDetailsButton
             Spacer()
-            Button("Deny") { monitor.respond(to: event.id, with: "deny") }
+            Button("Deny") {
+                // Close the detail popover before the event-resolved layout
+                // change kicks in — a popover dismiss that races with the
+                // window resize produces a visible empty rectangle above Navi.
+                showingDetails = false
+                monitor.respond(to: event.id, with: "deny")
+            }
                 .buttonStyle(.bordered)
                 .tint(.red)
                 .controlSize(.small)
-            Button("Approve") { monitor.respond(to: event.id, with: "approve") }
+            Button("Approve") {
+                showingDetails = false
+                monitor.respond(to: event.id, with: "approve")
+            }
                 .buttonStyle(.borderedProminent)
                 .tint(.blue)
                 .controlSize(.small)
@@ -1495,6 +1572,7 @@ struct EventRow: View {
 
     private var respondInTerminalLabel: some View {
         HStack(spacing: 4) {
+            showDetailsButton
             Spacer()
             Label("Respond in terminal", systemImage: "terminal.fill")
                 .font(.system(size: 11 * s, weight: .medium))
@@ -1535,9 +1613,20 @@ struct WindowAccessor: NSViewRepresentable {
             window.titlebarAppearsTransparent = true
             window.titleVisibility = .hidden
             window.styleMask.insert(.fullSizeContentView)
+            // Minimum window size at the AppKit level. The content frame also
+            // enforces minWidth: 360 so these match. The dynamic "don't shrink
+            // while events exist" rule in resizeWindow handles the transient
+            // jitter window — this minSize is just the floor the user can drag.
+            window.minSize = NSSize(width: 360, height: 200)
             // Restore saved position, or default to top-right corner
             if !window.setFrameAutosaveName("NaviWindow") {
                 // Name already set — frame restored automatically
+            }
+            // If the autosaved frame is below the new minimum, grow it.
+            if window.frame.width < 360 {
+                var frame = window.frame
+                frame.size.width = 360
+                window.setFrame(frame, display: true)
             }
             if UserDefaults.standard.string(forKey: "NSWindow Frame NaviWindow") == nil,
                let screen = window.screen {
@@ -1557,6 +1646,17 @@ struct WindowAccessor: NSViewRepresentable {
                 name: NSWindow.willCloseNotification,
                 object: window
             )
+            // When the user finishes a live (drag) resize, remember that size
+            // as a floor so auto-shrink doesn't take the window back below it.
+            NotificationCenter.default.addObserver(
+                forName: NSWindow.didEndLiveResizeNotification,
+                object: window,
+                queue: .main
+            ) { note in
+                guard let win = note.object as? NSWindow else { return }
+                UserDefaults.standard.set(Double(win.frame.width), forKey: "NaviUserMinWidth")
+                UserDefaults.standard.set(Double(win.frame.height), forKey: "NaviUserMinHeight")
+            }
         }
         return view
     }
@@ -1600,7 +1700,7 @@ struct NaviApp: App {
         }
         .windowStyle(.titleBar)
         .windowToolbarStyle(.unified(showsTitle: false))
-        .windowResizability(.contentSize)
+        .windowResizability(.contentMinSize)
         .defaultPosition(.topTrailing)
     }
 }

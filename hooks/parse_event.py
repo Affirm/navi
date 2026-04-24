@@ -6,6 +6,7 @@ and prints event_name<TAB>event_id to stdout for the shell script to consume.
 
 import sys
 import json
+import secrets
 import time
 import os
 
@@ -46,18 +47,49 @@ ti = d.get("tool_input", {})
 if not isinstance(ti, dict):
     ti = {}
 
-detailed = feature_enabled("detailed-permissions") and d.get("hook_event_name") == "PermissionRequest"
+is_permission = d.get("hook_event_name") == "PermissionRequest"
 
-def _trunc(s, n=140):
-    return s if detailed or len(s) <= n else s[: n - 3] + "..."
+
+def _render(value, level=0):
+    """Render a value as human-readable text (no JSON escape sequences).
+
+    Multi-line strings become indented blocks so code/diffs stay readable.
+    Nested dicts/lists recurse with deeper indentation.
+    """
+    pad = "  " * level
+    if isinstance(value, str):
+        if "\n" in value:
+            inner = "  " * (level + 1)
+            return "\n".join(inner + line for line in value.split("\n"))
+        return value
+    if isinstance(value, dict):
+        lines = []
+        for k, v in value.items():
+            if isinstance(v, (dict, list)) or (isinstance(v, str) and "\n" in v):
+                lines.append("{}{}:".format(pad, k))
+                lines.append(_render(v, level + 1))
+            else:
+                lines.append("{}{}: {}".format(pad, k, _render(v, level)))
+        return "\n".join(lines)
+    if isinstance(value, list):
+        return "\n".join("{}- {}".format(pad, _render(item, level + 1)) for item in value)
+    return json.dumps(value, ensure_ascii=False)
+
 
 parts = []
 if tool:
     parts.append("Tool: " + tool)
 
+# Show the human-readable description whenever it's present. Claude Code
+# uses this as the summary line under the command, so surfacing it in Navi
+# gives the user the same at-a-glance context.
+desc = ti.get("description", "")
+if desc:
+    parts.append("Description: " + desc)
+
 cmd = ti.get("command", "")
 if cmd:
-    parts.append("Command: " + _trunc(cmd))
+    parts.append("Command: " + cmd)
 
 fp = ti.get("file_path", "")
 if fp:
@@ -65,19 +97,15 @@ if fp:
 
 prompt = ti.get("prompt", "")
 if prompt and not cmd and not fp:
-    parts.append(_trunc(prompt))
+    parts.append(prompt)
 
-desc = ti.get("description", "")
-if desc and not cmd and not fp and not prompt:
-    parts.append(_trunc(desc))
-
-# Detailed mode: append any remaining tool_input fields as JSON so the user
-# sees the whole request, not just the primary field.
-if detailed:
+# Permissions: append any remaining tool_input fields in readable form so the
+# user sees the full request in the detail popover.
+if is_permission:
     shown = {"command", "file_path", "prompt", "description"}
     extras = {k: v for k, v in ti.items() if k not in shown}
     if extras:
-        parts.append(json.dumps(extras, indent=2, ensure_ascii=False))
+        parts.append(_render(extras))
 
 body = "\n".join(parts)
 session_id = d.get("session_id", "")
@@ -112,7 +140,10 @@ tty = os.environ.get("NAVI_TTY", "")
 pid = int(ppid) if ppid and ppid.isdigit() else 0
 hook_timeout = int(os.environ.get("NAVI_HOOK_TIMEOUT", "120"))
 timestamp = time.time()
-event_id = "{}-{}-{}".format(int(timestamp), os.getpid(), os.getpid() % 32768)
+# Nonce is 128 bits of entropy so a local attacker can't pre-write an
+# approve decision to /tmp/navi/responses/<event_id>. Keep the timestamp
+# prefix for sortability in directory listings and debug output.
+event_id = "{}-{}".format(int(timestamp), secrets.token_hex(16))
 
 # Write event file if recognized
 TYPE_MAP = {
