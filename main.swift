@@ -1371,6 +1371,11 @@ struct ContentView: View {
 
 // MARK: - Session Section
 
+private func headTruncated(_ path: String, max: Int) -> String {
+    if path.count <= max { return path }
+    return "\u{2026}" + String(path.suffix(max - 1))
+}
+
 struct SessionSection: View {
     let group: SessionGroup
     @ObservedObject var monitor: EventMonitor
@@ -1451,7 +1456,21 @@ struct SessionSection: View {
 
                 if floatingManager.anyEnrichmentToggleOn {
                     FlowLayout(spacing: 6) {
-                        EmptyView()
+                        if floatingManager.showFolderEnabled && !group.info.cwd.isEmpty {
+                            HStack(spacing: 4) {
+                                Image(systemName: "folder")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Text(headTruncated(group.info.cwd, max: 28))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.primary.opacity(0.06))
+                            .cornerRadius(4)
+                            .help(group.info.cwd)
+                        }
                     }
                     .padding(.horizontal, 10)
                     .padding(.bottom, 4)
