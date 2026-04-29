@@ -195,6 +195,18 @@ struct GitInfo: Equatable {
     let fetchedAt: Date
 }
 
+struct TranscriptInfo: Equatable {
+    let model: String?
+    let permissionMode: String?
+    let fetchedAt: Date
+
+    // Equality ignores fetchedAt so SwiftUI does not re-render when only the
+    // refresh timestamp changes; values are what the UI actually depends on.
+    static func == (lhs: TranscriptInfo, rhs: TranscriptInfo) -> Bool {
+        lhs.model == rhs.model && lhs.permissionMode == rhs.permissionMode
+    }
+}
+
 // MARK: - Model
 
 struct NaviEvent: Identifiable {
@@ -595,6 +607,7 @@ class EventMonitor: ObservableObject {
 
 final class EnrichmentService: ObservableObject {
     @Published private(set) var gitInfoByCwd: [String: GitInfo] = [:]
+    @Published private(set) var transcriptInfoBySid: [String: TranscriptInfo] = [:]
 
     private let queue = DispatchQueue(label: "navi.enrichment", qos: .utility)
     private var gitCache: [String: GitInfo] = [:]
@@ -603,6 +616,11 @@ final class EnrichmentService: ObservableObject {
     private var lastRefreshScheduledByCwd: [String: Date] = [:]
     private var loggedOnce: Set<String> = []
     private var gitAvailable: Bool = true
+
+    private var transcriptCache: [String: TranscriptInfo] = [:]
+    private var pendingTranscriptRefreshes: Set<String> = []
+    private var inFlightTranscriptRefreshes: Set<String> = []
+    private var lastTranscriptRefreshBySid: [String: Date] = [:]
 
     unowned let floatingManager: FloatingWindowManager
 
@@ -615,6 +633,16 @@ final class EnrichmentService: ObservableObject {
         let cwd = session.cwd
         guard !cwd.isEmpty else { return }
         scheduleGitRefresh(cwd: cwd)
+        if floatingManager.showModeEnabled || floatingManager.showModelEnabled,
+           !session.id.isEmpty {
+            scheduleTranscriptRefresh(sessionID: session.id, cwd: cwd)
+        }
+    }
+
+    func transcriptInfo(for sessionID: String) -> TranscriptInfo? {
+        var cached: TranscriptInfo?
+        queue.sync { cached = transcriptCache[sessionID] }
+        return cached
     }
 
     func gitInfo(for cwd: String) -> GitInfo? {
@@ -750,6 +778,145 @@ final class EnrichmentService: ObservableObject {
 
     private func handleBranchSwitch(cwd: String, oldBranch: String, newBranch: String) {
         _ = (cwd, oldBranch, newBranch)
+    }
+
+    private func scheduleTranscriptRefresh(sessionID: String, cwd: String) {
+        queue.async { [weak self] in
+            guard let self = self else { return }
+            if self.pendingTranscriptRefreshes.contains(sessionID) ||
+               self.inFlightTranscriptRefreshes.contains(sessionID) {
+                return
+            }
+            if let last = self.lastTranscriptRefreshBySid[sessionID],
+               Date().timeIntervalSince(last) < 0.5 {
+                self.pendingTranscriptRefreshes.insert(sessionID)
+                let delay = 0.5 - Date().timeIntervalSince(last)
+                self.queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+                    guard let self = self else { return }
+                    self.pendingTranscriptRefreshes.remove(sessionID)
+                    self.runTranscriptRefresh(sessionID: sessionID, cwd: cwd)
+                }
+                return
+            }
+            self.runTranscriptRefresh(sessionID: sessionID, cwd: cwd)
+        }
+    }
+
+    private func runTranscriptRefresh(sessionID: String, cwd: String) {
+        if inFlightTranscriptRefreshes.contains(sessionID) { return }
+        inFlightTranscriptRefreshes.insert(sessionID)
+        lastTranscriptRefreshBySid[sessionID] = Date()
+        defer { inFlightTranscriptRefreshes.remove(sessionID) }
+
+        guard let url = transcriptURL(forSessionID: sessionID, cwd: cwd) else {
+            if transcriptCache.removeValue(forKey: sessionID) != nil {
+                DispatchQueue.main.async { [weak self] in
+                    self?.transcriptInfoBySid.removeValue(forKey: sessionID)
+                }
+            }
+            return
+        }
+
+        guard let lines = readTranscriptTail(url: url) else {
+            if transcriptCache.removeValue(forKey: sessionID) != nil {
+                DispatchQueue.main.async { [weak self] in
+                    self?.transcriptInfoBySid.removeValue(forKey: sessionID)
+                }
+            }
+            return
+        }
+
+        var model: String? = nil
+        var permissionMode: String? = nil
+        var consecutiveParseFailures = 0
+        var maxConsecutiveFailures = 0
+        for line in lines.reversed() {
+            if model != nil && permissionMode != nil { break }
+            guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else {
+                consecutiveParseFailures += 1
+                maxConsecutiveFailures = max(maxConsecutiveFailures, consecutiveParseFailures)
+                continue
+            }
+            consecutiveParseFailures = 0
+            if model == nil,
+               let message = obj["message"] as? [String: Any],
+               (message["role"] as? String) == "assistant",
+               let m = message["model"] as? String, !m.isEmpty {
+                model = m
+            }
+            if permissionMode == nil {
+                if let pm = obj["permissionMode"] as? String, !pm.isEmpty {
+                    permissionMode = pm
+                } else if let message = obj["message"] as? [String: Any],
+                          let pm = message["permissionMode"] as? String, !pm.isEmpty {
+                    permissionMode = pm
+                }
+            }
+        }
+        if maxConsecutiveFailures >= 3 {
+            let key = "transcript-parse-\(sessionID)"
+            if !loggedOnce.contains(key) {
+                loggedOnce.insert(key)
+                NSLog("[Navi] transcript parse error for session \(sessionID): \(maxConsecutiveFailures) consecutive lines failed to parse")
+            }
+        }
+
+        let existing = transcriptCache[sessionID]
+        if model == nil && permissionMode == nil && existing == nil {
+            return
+        }
+
+        let newInfo = TranscriptInfo(model: model, permissionMode: permissionMode, fetchedAt: Date())
+        if existing == newInfo { return }
+        transcriptCache[sessionID] = newInfo
+        DispatchQueue.main.async { [weak self] in
+            self?.transcriptInfoBySid[sessionID] = newInfo
+        }
+    }
+
+    private func transcriptURL(forSessionID sessionID: String, cwd: String) -> URL? {
+        let projectsRoot = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude/projects", isDirectory: true)
+        let direct = projectsRoot
+            .appendingPathComponent(encodedProjectDir(forCwd: cwd), isDirectory: true)
+            .appendingPathComponent("\(sessionID).jsonl", isDirectory: false)
+        if FileManager.default.fileExists(atPath: direct.path) { return direct }
+
+        // Fallback: scan one level under ~/.claude/projects/ for <sessionID>.jsonl.
+        let fm = FileManager.default
+        guard let entries = try? fm.contentsOfDirectory(at: projectsRoot,
+                                                       includingPropertiesForKeys: [.isDirectoryKey],
+                                                       options: [.skipsHiddenFiles])
+        else { return nil }
+        for dir in entries {
+            var isDir: ObjCBool = false
+            guard fm.fileExists(atPath: dir.path, isDirectory: &isDir), isDir.boolValue else { continue }
+            let candidate = dir.appendingPathComponent("\(sessionID).jsonl", isDirectory: false)
+            if fm.fileExists(atPath: candidate.path) { return candidate }
+        }
+        return nil
+    }
+
+    private func encodedProjectDir(forCwd cwd: String) -> String {
+        cwd.replacingOccurrences(of: "/", with: "-")
+    }
+
+    private func readTranscriptTail(url: URL, maxBytes: Int = 65_536) -> [Data]? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        let fileSize = (try? handle.seekToEnd()) ?? 0
+        guard fileSize > 0 else { return nil }
+        let start = fileSize > UInt64(maxBytes) ? fileSize - UInt64(maxBytes) : 0
+        do { try handle.seek(toOffset: start) } catch { return nil }
+        var data = handle.readDataToEndOfFile()
+        if data.isEmpty { return nil }
+
+        if start > 0 {
+            guard let firstNewline = data.firstIndex(of: 0x0A) else { return nil }
+            data = data.subdata(in: data.index(after: firstNewline)..<data.endIndex)
+        }
+
+        return data.split(separator: 0x0A, omittingEmptySubsequences: true).map(Data.init)
     }
 
     private func runProcess(executable: String, args: [String], timeout: TimeInterval = 2.0) -> (stdout: String, exitCode: Int32)? {
@@ -1643,6 +1810,13 @@ private func middleTruncated(_ s: String, max: Int) -> String {
     return String(s.prefix(prefixLen)) + "\u{2026}" + String(s.suffix(suffixLen))
 }
 
+private func shortModel(_ raw: String) -> String {
+    var s = raw
+    if s.hasPrefix("claude-") { s = String(s.dropFirst("claude-".count)) }
+    if s.lowercased().hasSuffix("-1m") { s = String(s.dropLast(3)) }
+    return s
+}
+
 struct SessionSection: View {
     let group: SessionGroup
     @ObservedObject var monitor: EventMonitor
@@ -1768,6 +1942,26 @@ struct SessionSection: View {
                             .background(bg)
                             .cornerRadius(4)
                             .help(git.branch)
+                        }
+                        if floatingManager.showModeEnabled,
+                           let mode = enrichmentService.transcriptInfoBySid[group.info.id]?.permissionMode {
+                            Text(mode)
+                                .font(.caption)
+                                .foregroundStyle(.primary)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color.pastelBlue.opacity(0.15))
+                                .clipShape(Capsule())
+                        }
+                        if floatingManager.showModelEnabled,
+                           let model = enrichmentService.transcriptInfoBySid[group.info.id]?.model {
+                            Text(shortModel(model))
+                                .font(.caption)
+                                .foregroundStyle(.primary)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color.pastelPurple.opacity(0.15))
+                                .clipShape(Capsule())
                         }
                     }
                     .padding(.horizontal, 10)
