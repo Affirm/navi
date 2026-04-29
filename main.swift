@@ -685,20 +685,6 @@ final class EnrichmentService: ObservableObject {
         }
     }
 
-    func gitInfo(for cwd: String) -> GitInfo? {
-        var cached: GitInfo?
-        queue.sync {
-            cached = gitCache[cwd]
-        }
-        if let cached = cached, Date().timeIntervalSince(cached.fetchedAt) < 5 {
-            return cached
-        }
-        if floatingManager.anyEnrichmentToggleOn {
-            scheduleGitRefresh(cwd: cwd)
-        }
-        return cached
-    }
-
     private func scheduleGitRefresh(cwd: String) {
         queue.async { [weak self] in
             guard let self = self else { return }
@@ -809,7 +795,7 @@ final class EnrichmentService: ObservableObject {
         let prevBranch = gitCache[cwd]?.branch
         gitCache[cwd] = newInfo
         if let prev = prevBranch, prev != newInfo.branch {
-            handleBranchSwitch(cwd: cwd, oldBranch: prev, newBranch: newInfo.branch)
+            handleBranchSwitch(cwd: cwd, oldBranch: prev)
         }
 
         DispatchQueue.main.async { [weak self] in
@@ -822,7 +808,7 @@ final class EnrichmentService: ObservableObject {
         }
     }
 
-    private func handleBranchSwitch(cwd: String, oldBranch: String, newBranch: String) {
+    private func handleBranchSwitch(cwd: String, oldBranch: String) {
         invalidatePRCache(cwd: cwd, branch: oldBranch)
     }
 
