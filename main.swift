@@ -691,6 +691,12 @@ final class EnrichmentService: ObservableObject {
             if self.pendingRefreshes.contains(cwd) || self.inFlightRefreshes.contains(cwd) {
                 return
             }
+            // AC-24: enforce 5s TTL — within 5s of a successful refresh, return cached value
+            // without spawning git subprocesses. Mirrors PR cache TTL at schedulePRRefresh.
+            if let cached = self.gitCache[cwd],
+               Date().timeIntervalSince(cached.fetchedAt) < 5.0 {
+                return
+            }
             if let last = self.lastRefreshScheduledByCwd[cwd],
                Date().timeIntervalSince(last) < 0.5 {
                 self.pendingRefreshes.insert(cwd)
