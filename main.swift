@@ -207,6 +207,17 @@ struct TranscriptInfo: Equatable {
     }
 }
 
+struct PRInfo: Equatable {
+    let number: Int
+    let url: URL
+    let branch: String
+    let fetchedAt: Date
+
+    static func == (lhs: PRInfo, rhs: PRInfo) -> Bool {
+        lhs.number == rhs.number && lhs.url == rhs.url && lhs.branch == rhs.branch
+    }
+}
+
 // MARK: - Model
 
 struct NaviEvent: Identifiable {
@@ -608,6 +619,7 @@ class EventMonitor: ObservableObject {
 final class EnrichmentService: ObservableObject {
     @Published private(set) var gitInfoByCwd: [String: GitInfo] = [:]
     @Published private(set) var transcriptInfoBySid: [String: TranscriptInfo] = [:]
+    @Published private(set) var prInfoByCwdBranch: [String: PRInfo] = [:]
 
     private let queue = DispatchQueue(label: "navi.enrichment", qos: .utility)
     private var gitCache: [String: GitInfo] = [:]
@@ -622,10 +634,21 @@ final class EnrichmentService: ObservableObject {
     private var inFlightTranscriptRefreshes: Set<String> = []
     private var lastTranscriptRefreshBySid: [String: Date] = [:]
 
+    private var prCache: [String: PRInfo] = [:]
+    private var pendingPRRefreshes: Set<String> = []
+    private var inFlightPRRefreshes: Set<String> = []
+    private var lastPRRefreshByKey: [String: Date] = [:]
+    private var ghAvailable: Bool = false
+    private var ghProbeDone: Bool = false
+
     unowned let floatingManager: FloatingWindowManager
 
     init(floatingManager: FloatingWindowManager) {
         self.floatingManager = floatingManager
+    }
+
+    static func prKey(cwd: String, branch: String) -> String {
+        "\(cwd)\u{1f}\(branch)"
     }
 
     func refresh(for session: SessionInfo) {
@@ -774,10 +797,147 @@ final class EnrichmentService: ObservableObject {
         DispatchQueue.main.async { [weak self] in
             self?.gitInfoByCwd[cwd] = newInfo
         }
+
+        if floatingManager.showGitEnabled,
+           !newInfo.isDetached, !newInfo.branch.isEmpty {
+            schedulePRRefresh(cwd: cwd, branch: newInfo.branch)
+        }
     }
 
     private func handleBranchSwitch(cwd: String, oldBranch: String, newBranch: String) {
-        _ = (cwd, oldBranch, newBranch)
+        invalidatePRCache(cwd: cwd, branch: oldBranch)
+    }
+
+    private func probeGhAvailability() {
+        guard !ghProbeDone else { return }
+        ghProbeDone = true
+
+        let candidatePaths = ["/opt/homebrew/bin/gh", "/usr/local/bin/gh", "/usr/bin/gh"]
+        let installed = candidatePaths.contains { FileManager.default.isExecutableFile(atPath: $0) }
+        if !installed {
+            ghAvailable = false
+            if !loggedOnce.contains("gh-not-found") {
+                loggedOnce.insert("gh-not-found")
+                NSLog("[Navi] gh not found on PATH; PR enrichment disabled.")
+            }
+            return
+        }
+
+        guard let auth = runProcess(executable: "gh", args: ["auth", "status"]) else {
+            ghAvailable = false
+            if !loggedOnce.contains("gh-auth-failed") {
+                loggedOnce.insert("gh-auth-failed")
+                NSLog("[Navi] gh authentication failed; PR enrichment disabled.")
+            }
+            return
+        }
+        if auth.exitCode == 0 {
+            ghAvailable = true
+        } else {
+            ghAvailable = false
+            if !loggedOnce.contains("gh-auth-failed") {
+                loggedOnce.insert("gh-auth-failed")
+                NSLog("[Navi] gh authentication failed; PR enrichment disabled.")
+            }
+        }
+    }
+
+    private func schedulePRRefresh(cwd: String, branch: String) {
+        let key = Self.prKey(cwd: cwd, branch: branch)
+        queue.async { [weak self] in
+            guard let self = self else { return }
+            if !self.ghProbeDone {
+                self.probeGhAvailability()
+            }
+            guard self.ghAvailable else { return }
+            if self.pendingPRRefreshes.contains(key) || self.inFlightPRRefreshes.contains(key) {
+                return
+            }
+            if let cached = self.prCache[key],
+               Date().timeIntervalSince(cached.fetchedAt) < 60 {
+                return
+            }
+            if let last = self.lastPRRefreshByKey[key],
+               Date().timeIntervalSince(last) < 0.5 {
+                self.pendingPRRefreshes.insert(key)
+                let delay = 0.5 - Date().timeIntervalSince(last)
+                self.queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+                    guard let self = self else { return }
+                    self.pendingPRRefreshes.remove(key)
+                    self.runPRRefresh(cwd: cwd, branch: branch)
+                }
+                return
+            }
+            self.runPRRefresh(cwd: cwd, branch: branch)
+        }
+    }
+
+    private func runPRRefresh(cwd: String, branch: String) {
+        guard ghAvailable else { return }
+        if branch.isEmpty || branch == "HEAD" { return }
+
+        let key = Self.prKey(cwd: cwd, branch: branch)
+        if inFlightPRRefreshes.contains(key) { return }
+        inFlightPRRefreshes.insert(key)
+        lastPRRefreshByKey[key] = Date()
+        // runs synchronously on the serial queue, so defer is safe.
+        defer { inFlightPRRefreshes.remove(key) }
+
+        guard let result = runProcess(
+            executable: "gh",
+            args: ["pr", "list", "--head", branch, "--state", "open", "--json", "number,url", "--limit", "1"],
+            cwd: cwd
+        ) else {
+            return
+        }
+
+        if result.exitCode != 0 {
+            if !loggedOnce.contains("gh-pr-list-failed") {
+                loggedOnce.insert("gh-pr-list-failed")
+                NSLog("[Navi] gh pr list failed; preserving cached PR data.")
+            }
+            return
+        }
+
+        guard let data = result.stdout.data(using: .utf8),
+              let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            return
+        }
+
+        if arr.isEmpty {
+            if prCache.removeValue(forKey: key) != nil {
+                DispatchQueue.main.async { [weak self] in
+                    self?.prInfoByCwdBranch.removeValue(forKey: key)
+                }
+            }
+            return
+        }
+
+        guard let first = arr.first,
+              let number = first["number"] as? Int,
+              let urlString = first["url"] as? String,
+              let url = URL(string: urlString) else {
+            return
+        }
+
+        let newInfo = PRInfo(number: number, url: url, branch: branch, fetchedAt: Date())
+        let existing = prCache[key]
+        if existing == newInfo { return }
+        prCache[key] = newInfo
+        DispatchQueue.main.async { [weak self] in
+            self?.prInfoByCwdBranch[key] = newInfo
+        }
+    }
+
+    private func invalidatePRCache(cwd: String, branch: String) {
+        let key = Self.prKey(cwd: cwd, branch: branch)
+        if prCache.removeValue(forKey: key) != nil {
+            DispatchQueue.main.async { [weak self] in
+                self?.prInfoByCwdBranch.removeValue(forKey: key)
+            }
+        }
+        pendingPRRefreshes.remove(key)
+        lastPRRefreshByKey.removeValue(forKey: key)
     }
 
     private func scheduleTranscriptRefresh(sessionID: String, cwd: String) {
@@ -919,7 +1079,7 @@ final class EnrichmentService: ObservableObject {
         return data.split(separator: 0x0A, omittingEmptySubsequences: true).map(Data.init)
     }
 
-    private func runProcess(executable: String, args: [String], timeout: TimeInterval = 2.0) -> (stdout: String, exitCode: Int32)? {
+    private func runProcess(executable: String, args: [String], cwd: String? = nil, timeout: TimeInterval = 2.0) -> (stdout: String, exitCode: Int32)? {
         let process = Process()
         let candidatePaths: [String]
         if executable == "git" {
@@ -942,6 +1102,10 @@ final class EnrichmentService: ObservableObject {
         } else {
             process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
             process.arguments = [executable] + args
+        }
+
+        if let cwd = cwd, !cwd.isEmpty {
+            process.currentDirectoryURL = URL(fileURLWithPath: cwd)
         }
 
         var env = ProcessInfo.processInfo.environment
@@ -1942,6 +2106,29 @@ struct SessionSection: View {
                             .background(bg)
                             .cornerRadius(4)
                             .help(git.branch)
+                        }
+                        if floatingManager.showGitEnabled,
+                           let git = enrichmentService.gitInfoByCwd[group.info.cwd],
+                           !git.isDetached, !git.branch.isEmpty,
+                           let pr = enrichmentService.prInfoByCwdBranch[EnrichmentService.prKey(cwd: group.info.cwd, branch: git.branch)] {
+                            Button {
+                                NSWorkspace.shared.open(pr.url)
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "arrow.up.forward.app")
+                                        .font(.caption)
+                                        .foregroundStyle(.tint)
+                                    Text("#\(pr.number)")
+                                        .font(.caption)
+                                        .foregroundStyle(.tint)
+                                }
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color.primary.opacity(0.06))
+                                .cornerRadius(4)
+                            }
+                            .buttonStyle(.plain)
+                            .help("Open PR #\(pr.number) in browser")
                         }
                         if floatingManager.showModeEnabled,
                            let mode = enrichmentService.transcriptInfoBySid[group.info.id]?.permissionMode {
