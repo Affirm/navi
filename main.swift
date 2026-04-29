@@ -33,6 +33,18 @@ func scaledFont(size: CGFloat, weight: Font.Weight = .regular, design: Font.Desi
 
 // MARK: - Helpers
 
+/// One-shot NSLog gate. The first call for a given key emits the message; subsequent
+/// calls with the same key are silently dropped. Owner must serialize access (e.g.
+/// confine to a single DispatchQueue).
+struct LoggedOnce {
+    private var keys: Set<String> = []
+    mutating func log(key: String, _ message: @autoclosure () -> String) {
+        guard !keys.contains(key) else { return }
+        keys.insert(key)
+        NSLog("%@", message())
+    }
+}
+
 private func relativeTime(from date: Date, to now: Date) -> String {
     let seconds = Int(now.timeIntervalSince(date))
     if seconds < 5 { return "now" }
@@ -193,6 +205,17 @@ struct GitInfo: Equatable {
     let behind: Int?
     let defaultBranch: String?
     let fetchedAt: Date
+
+    // Equality ignores fetchedAt so SwiftUI does not re-render every refresh when
+    // the data the badge displays has not actually changed.
+    static func == (lhs: GitInfo, rhs: GitInfo) -> Bool {
+        lhs.branch == rhs.branch
+            && lhs.isDirty == rhs.isDirty
+            && lhs.isDetached == rhs.isDetached
+            && lhs.ahead == rhs.ahead
+            && lhs.behind == rhs.behind
+            && lhs.defaultBranch == rhs.defaultBranch
+    }
 }
 
 struct TranscriptInfo: Equatable {
@@ -626,7 +649,7 @@ final class EnrichmentService: ObservableObject {
     private var pendingRefreshes: Set<String> = []
     private var inFlightRefreshes: Set<String> = []
     private var lastRefreshScheduledByCwd: [String: Date] = [:]
-    private var loggedOnce: Set<String> = []
+    private var logged = LoggedOnce()
     private var gitAvailable: Bool = true
 
     private var transcriptCache: [String: TranscriptInfo] = [:]
@@ -660,12 +683,6 @@ final class EnrichmentService: ObservableObject {
            !session.id.isEmpty {
             scheduleTranscriptRefresh(sessionID: session.id, cwd: cwd)
         }
-    }
-
-    func transcriptInfo(for sessionID: String) -> TranscriptInfo? {
-        var cached: TranscriptInfo?
-        queue.sync { cached = transcriptCache[sessionID] }
-        return cached
     }
 
     func gitInfo(for cwd: String) -> GitInfo? {
@@ -704,6 +721,7 @@ final class EnrichmentService: ObservableObject {
     }
 
     private func runGitRefresh(cwd: String) {
+        // Defensive on-queue reentrancy guard; matches the PR/transcript refresh shape.
         if inFlightRefreshes.contains(cwd) { return }
         inFlightRefreshes.insert(cwd)
         lastRefreshScheduledByCwd[cwd] = Date()
@@ -816,29 +834,20 @@ final class EnrichmentService: ObservableObject {
         let installed = candidatePaths.contains { FileManager.default.isExecutableFile(atPath: $0) }
         if !installed {
             ghAvailable = false
-            if !loggedOnce.contains("gh-not-found") {
-                loggedOnce.insert("gh-not-found")
-                NSLog("[Navi] gh not found on PATH; PR enrichment disabled.")
-            }
+            logged.log(key: "gh-not-found", "[Navi] gh not found on PATH; PR enrichment disabled.")
             return
         }
 
         guard let auth = runProcess(executable: "gh", args: ["auth", "status"]) else {
             ghAvailable = false
-            if !loggedOnce.contains("gh-auth-failed") {
-                loggedOnce.insert("gh-auth-failed")
-                NSLog("[Navi] gh authentication failed; PR enrichment disabled.")
-            }
+            logged.log(key: "gh-auth-failed", "[Navi] gh authentication failed; PR enrichment disabled.")
             return
         }
         if auth.exitCode == 0 {
             ghAvailable = true
         } else {
             ghAvailable = false
-            if !loggedOnce.contains("gh-auth-failed") {
-                loggedOnce.insert("gh-auth-failed")
-                NSLog("[Navi] gh authentication failed; PR enrichment disabled.")
-            }
+            logged.log(key: "gh-auth-failed", "[Navi] gh authentication failed; PR enrichment disabled.")
         }
     }
 
@@ -892,10 +901,7 @@ final class EnrichmentService: ObservableObject {
         }
 
         if result.exitCode != 0 {
-            if !loggedOnce.contains("gh-pr-list-failed") {
-                loggedOnce.insert("gh-pr-list-failed")
-                NSLog("[Navi] gh pr list failed; preserving cached PR data.")
-            }
+            logged.log(key: "gh-pr-list-failed", "[Navi] gh pr list failed; preserving cached PR data.")
             return
         }
 
@@ -1014,11 +1020,10 @@ final class EnrichmentService: ObservableObject {
             }
         }
         if maxConsecutiveFailures >= 3 {
-            let key = "transcript-parse-\(sessionID)"
-            if !loggedOnce.contains(key) {
-                loggedOnce.insert(key)
-                NSLog("[Navi] transcript parse error for session \(sessionID): \(maxConsecutiveFailures) consecutive lines failed to parse")
-            }
+            logged.log(
+                key: "transcript-parse-error-\(sessionID)",
+                "[Navi] transcript parse error for session \(sessionID): \(maxConsecutiveFailures) consecutive lines failed to parse"
+            )
         }
 
         let existing = transcriptCache[sessionID]
@@ -1076,7 +1081,22 @@ final class EnrichmentService: ObservableObject {
             data = data.subdata(in: data.index(after: firstNewline)..<data.endIndex)
         }
 
-        return data.split(separator: 0x0A, omittingEmptySubsequences: true).map(Data.init)
+        // Swift 6.3 has an ambiguous Sequence/Collection split overload on Data;
+        // build the result manually to sidestep it.
+        var lines: [Data] = []
+        var lineStart = data.startIndex
+        for i in data.indices {
+            if data[i] == 0x0A {
+                if i > lineStart {
+                    lines.append(data.subdata(in: lineStart..<i))
+                }
+                lineStart = data.index(after: i)
+            }
+        }
+        if lineStart < data.endIndex {
+            lines.append(data.subdata(in: lineStart..<data.endIndex))
+        }
+        return lines
     }
 
     private func runProcess(executable: String, args: [String], cwd: String? = nil, timeout: TimeInterval = 2.0) -> (stdout: String, exitCode: Int32)? {
@@ -1124,10 +1144,7 @@ final class EnrichmentService: ObservableObject {
             try process.run()
         } catch {
             if executable == "git" {
-                if !loggedOnce.contains("git-not-found") {
-                    loggedOnce.insert("git-not-found")
-                    NSLog("[Navi] git not found on PATH; git enrichment disabled.")
-                }
+                logged.log(key: "git-not-found", "[Navi] git not found on PATH; git enrichment disabled.")
                 gitAvailable = false
             }
             return nil
@@ -1136,10 +1153,7 @@ final class EnrichmentService: ObservableObject {
         if semaphore.wait(timeout: .now() + timeout) == .timedOut {
             process.terminate()
             _ = semaphore.wait(timeout: .now() + 0.5)
-            if !loggedOnce.contains("timeout-\(executable)") {
-                loggedOnce.insert("timeout-\(executable)")
-                NSLog("[Navi] subprocess timeout: \(executable)")
-            }
+            logged.log(key: "subprocess-timeout-\(executable)", "[Navi] subprocess timeout: \(executable)")
             return nil
         }
 

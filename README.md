@@ -32,6 +32,7 @@ Hooks are registered automatically. Navi builds and launches itself the first ti
 | **Menu bar icon** | Toggle the window; icon signals pending permissions |
 | **Per-event sounds** | Configurable alerts for permission, completion, notification events |
 | **Multi-session** | Monitor many concurrent Claude Code sessions side-by-side |
+| **Session row badges** | Optional per-session badges for working folder, git status, permission mode, model, and open PR (each independently toggleable in Settings, all default off) |
 
 ## Requirements
 
