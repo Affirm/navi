@@ -121,6 +121,68 @@ func focusTerminal(tty: String) {
 
 let naviCurrentVersion = "1.1.3"
 
+// MARK: - Pastel Palette
+
+extension Color {
+    static let pastelGreen  = Color(hue: 0.33, saturation: 0.45, brightness: 0.85)
+    static let pastelYellow = Color(hue: 0.13, saturation: 0.45, brightness: 0.90)
+    static let pastelGray   = Color(hue: 0.00, saturation: 0.00, brightness: 0.75)
+    static let pastelBlue   = Color(hue: 0.58, saturation: 0.40, brightness: 0.90)
+    static let pastelPurple = Color(hue: 0.78, saturation: 0.40, brightness: 0.85)
+}
+
+// MARK: - FlowLayout
+
+struct FlowLayout: Layout {
+    var spacing: CGFloat = 6
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        guard !subviews.isEmpty else { return .zero }
+        let maxWidth = proposal.width ?? .infinity
+        var rowWidth: CGFloat = 0
+        var rowHeight: CGFloat = 0
+        var totalHeight: CGFloat = 0
+        var maxRowWidth: CGFloat = 0
+
+        for subview in subviews {
+            let size = subview.sizeThatFits(.unspecified)
+            let proposedRowWidth = rowWidth == 0 ? size.width : rowWidth + spacing + size.width
+            if proposedRowWidth > maxWidth && rowWidth > 0 {
+                maxRowWidth = max(maxRowWidth, rowWidth)
+                totalHeight += rowHeight + spacing
+                rowWidth = size.width
+                rowHeight = size.height
+            } else {
+                rowWidth = proposedRowWidth
+                rowHeight = max(rowHeight, size.height)
+            }
+        }
+        maxRowWidth = max(maxRowWidth, rowWidth)
+        totalHeight += rowHeight
+        return CGSize(width: maxRowWidth, height: totalHeight)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        guard !subviews.isEmpty else { return }
+        let maxWidth = bounds.width
+        var x = bounds.minX
+        var y = bounds.minY
+        var rowHeight: CGFloat = 0
+
+        for subview in subviews {
+            let size = subview.sizeThatFits(.unspecified)
+            if x + size.width > bounds.minX + maxWidth && x > bounds.minX {
+                x = bounds.minX
+                y += rowHeight + spacing
+                rowHeight = 0
+            }
+            subview.place(at: CGPoint(x: x, y: y), anchor: .topLeading, proposal: ProposedViewSize(size))
+            x += size.width + spacing
+            rowHeight = max(rowHeight, size.height)
+        }
+    }
+}
+
 // MARK: - Model
 
 struct NaviEvent: Identifiable {
@@ -622,6 +684,35 @@ class FloatingWindowManager: ObservableObject {
         }
     }
 
+    @Published var showFolderEnabled: Bool {
+        didSet { UserDefaults.standard.set(showFolderEnabled, forKey: "NaviExp.ShowFolder") }
+    }
+
+    @Published var showGitEnabled: Bool {
+        didSet { UserDefaults.standard.set(showGitEnabled, forKey: "NaviExp.ShowGit") }
+    }
+
+    @Published var showModeEnabled: Bool {
+        didSet { UserDefaults.standard.set(showModeEnabled, forKey: "NaviExp.ShowMode") }
+    }
+
+    @Published var showModelEnabled: Bool {
+        didSet { UserDefaults.standard.set(showModelEnabled, forKey: "NaviExp.ShowModel") }
+    }
+
+    var anyEnrichmentToggleOn: Bool {
+        showFolderEnabled || showGitEnabled || showModeEnabled || showModelEnabled
+    }
+
+    var computedWindowWidth: CGFloat {
+        switch (anyEnrichmentToggleOn, detailedPermissionsEnabled) {
+        case (false, false): return 360
+        case (false, true):  return 520
+        case (true,  false): return 480
+        case (true,  true):  return 560
+        }
+    }
+
     /// Set to true when a feature that requires a Navi restart is toggled.
     /// The UI observes this to show a restart prompt.
     @Published var pendingRestart = false
@@ -739,6 +830,10 @@ class FloatingWindowManager: ObservableObject {
             sessionStatusEnabled = UserDefaults.standard.bool(forKey: "NaviExp.SessionStatus")
         }
         detailedPermissionsEnabled = UserDefaults.standard.bool(forKey: "NaviExp.DetailedPermissions")
+        showFolderEnabled = UserDefaults.standard.bool(forKey: "NaviExp.ShowFolder")
+        showGitEnabled = UserDefaults.standard.bool(forKey: "NaviExp.ShowGit")
+        showModeEnabled = UserDefaults.standard.bool(forKey: "NaviExp.ShowMode")
+        showModelEnabled = UserDefaults.standard.bool(forKey: "NaviExp.ShowModel")
 
         // Show a session restart hint after a plugin version upgrade
         let lastVersion = UserDefaults.standard.string(forKey: "NaviLastVersion") ?? ""
@@ -819,7 +914,7 @@ class MenuBarManager: NSObject, ObservableObject {
         // Reuse existing popover, create once
         if popover == nil {
             let pop = NSPopover()
-            let width: CGFloat = floatingManager.detailedPermissionsEnabled ? 520 : 360
+            let width: CGFloat = floatingManager.computedWindowWidth
             pop.contentSize = NSSize(width: width, height: 500)
             pop.behavior = .transient
             pop.animates = true
@@ -899,7 +994,7 @@ struct ContentView: View {
                 sessionList
             }
         }
-        .frame(width: floatingManager.detailedPermissionsEnabled ? 520 : 360)
+        .frame(width: floatingManager.computedWindowWidth)
         .overlay(
             Group {
                 if isFloatingWindow {
@@ -1132,6 +1227,23 @@ struct ContentView: View {
             experimentalRow("Detailed permissions", subtitle: "Show the full tool input for permission requests. Widens the Navi window.",
                 isOn: Binding(get: { floatingManager.detailedPermissionsEnabled }, set: { floatingManager.detailedPermissionsEnabled = $0 }))
 
+            Text("Session details")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .padding(.top, 4)
+
+            experimentalRow("Folder path", subtitle: "Show the working directory for each session.",
+                isOn: Binding(get: { floatingManager.showFolderEnabled }, set: { floatingManager.showFolderEnabled = $0 }))
+
+            experimentalRow("Git status", subtitle: "Show branch, dirty state, and any open PR for each session.",
+                isOn: Binding(get: { floatingManager.showGitEnabled }, set: { floatingManager.showGitEnabled = $0 }))
+
+            experimentalRow("Claude mode", subtitle: "Show the active permission mode (plan, auto, acceptEdits, bypassPermissions).",
+                isOn: Binding(get: { floatingManager.showModeEnabled }, set: { floatingManager.showModeEnabled = $0 }))
+
+            experimentalRow("Claude model", subtitle: "Show the model used by each session (e.g. opus-4-7, sonnet-4-6).",
+                isOn: Binding(get: { floatingManager.showModelEnabled }, set: { floatingManager.showModelEnabled = $0 }))
+
             if floatingManager.pendingRestart {
                 restartBanner
             }
@@ -1273,67 +1385,77 @@ struct SessionSection: View {
     var body: some View {
         VStack(spacing: 0) {
             // Session header
-            HStack(spacing: 0) {
-                Button { withAnimation(.easeInOut(duration: 0.2)) { isExpanded.toggle() } } label: {
-                    HStack(spacing: 6) {
-                        Image(systemName: group.status.icon)
-                            .foregroundStyle(group.status.color)
-                            .font(.system(size: 13 * s))
-
-                        Image(systemName: "folder.fill")
-                            .foregroundStyle(.secondary)
-                            .font(.system(size: 11 * s))
-                        Text(group.info.displayName)
-                            .font(.system(size: 13 * s, weight: .semibold))
-
-                        Text(group.info.shortSession)
-                            .font(.system(size: 11 * s, design: .monospaced))
-                            .foregroundStyle(.tertiary)
-
-                        Spacer()
-
-                        if !group.status.label.isEmpty {
-                            Text(group.status.label)
-                                .font(.system(size: 11 * s, weight: .medium))
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 0) {
+                    Button { withAnimation(.easeInOut(duration: 0.2)) { isExpanded.toggle() } } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: group.status.icon)
                                 .foregroundStyle(group.status.color)
-                        }
+                                .font(.system(size: 13 * s))
 
-                        TimelineView(.periodic(from: .now, by: 1)) { context in
-                            Text(relativeTime(from: group.info.lastActivity, to: context.date))
+                            Image(systemName: "folder.fill")
+                                .foregroundStyle(.secondary)
                                 .font(.system(size: 11 * s))
-                                .foregroundStyle(.tertiary)
-                        }
+                            Text(group.info.displayName)
+                                .font(.system(size: 13 * s, weight: .semibold))
 
-                        if !group.events.isEmpty {
-                            Image(systemName: "chevron.right")
-                                .font(.system(size: 10 * s, weight: .bold))
+                            Text(group.info.shortSession)
+                                .font(.system(size: 11 * s, design: .monospaced))
                                 .foregroundStyle(.tertiary)
-                                .rotationEffect(.degrees(isExpanded ? 90 : 0))
-                        }
-                    }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-                }
-                .buttonStyle(.plain)
 
-                if floatingManager.terminalFocusEnabled && !group.info.tty.isEmpty {
-                    Button { focusTerminal(tty: group.info.tty) } label: {
-                        Image(systemName: "terminal.fill")
-                            .font(.system(size: 10 * s, weight: .bold))
-                            .foregroundStyle(.secondary)
+                            Spacer()
+
+                            if !group.status.label.isEmpty {
+                                Text(group.status.label)
+                                    .font(.system(size: 11 * s, weight: .medium))
+                                    .foregroundStyle(group.status.color)
+                            }
+
+                            TimelineView(.periodic(from: .now, by: 1)) { context in
+                                Text(relativeTime(from: group.info.lastActivity, to: context.date))
+                                    .font(.system(size: 11 * s))
+                                    .foregroundStyle(.tertiary)
+                            }
+
+                            if !group.events.isEmpty {
+                                Image(systemName: "chevron.right")
+                                    .font(.system(size: 10 * s, weight: .bold))
+                                    .foregroundStyle(.tertiary)
+                                    .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                            }
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
                     }
                     .buttonStyle(.plain)
-                    .help("Focus terminal")
-                    .padding(.trailing, 6)
+
+                    if floatingManager.terminalFocusEnabled && !group.info.tty.isEmpty {
+                        Button { focusTerminal(tty: group.info.tty) } label: {
+                            Image(systemName: "terminal.fill")
+                                .font(.system(size: 10 * s, weight: .bold))
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Focus terminal")
+                        .padding(.trailing, 6)
+                    }
+
+                    Button { monitor.dismissSession(group.id) } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 10 * s, weight: .bold))
+                            .foregroundStyle(.tertiary)
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.trailing, 10)
                 }
 
-                Button { monitor.dismissSession(group.id) } label: {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 10 * s, weight: .bold))
-                        .foregroundStyle(.tertiary)
+                if floatingManager.anyEnrichmentToggleOn {
+                    FlowLayout(spacing: 6) {
+                        EmptyView()
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.bottom, 4)
                 }
-                .buttonStyle(.plain)
-                .padding(.trailing, 10)
             }
 
             // Events
