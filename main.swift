@@ -183,6 +183,18 @@ struct FlowLayout: Layout {
     }
 }
 
+// MARK: - Enrichment Data Model
+
+struct GitInfo: Equatable {
+    let branch: String
+    let isDirty: Bool
+    let isDetached: Bool
+    let ahead: Int?
+    let behind: Int?
+    let defaultBranch: String?
+    let fetchedAt: Date
+}
+
 // MARK: - Model
 
 struct NaviEvent: Identifiable {
@@ -253,6 +265,14 @@ class EventMonitor: ObservableObject {
     private var knownIDs = Set<String>()
     private var timer: Timer?
     private var dirSource: DispatchSourceFileSystemObject?
+    weak var enrichmentService: EnrichmentService?
+
+    func attach(enrichmentService: EnrichmentService) {
+        self.enrichmentService = enrichmentService
+        for info in sessions.values {
+            enrichmentService.refresh(for: info)
+        }
+    }
 
     init() {
         let fm = FileManager.default
@@ -496,6 +516,9 @@ class EventMonitor: ObservableObject {
                 pid: pid_t(pid),
                 lastActivity: Date()
             )
+            if let info = sessions[sid] {
+                enrichmentService?.refresh(for: info)
+            }
         }
     }
 
@@ -531,6 +554,9 @@ class EventMonitor: ObservableObject {
             // Always update session name — it can change via /rename
             sessions[sid]!.sessionName = event.sessionName
         }
+        if let info = sessions[sid] {
+            enrichmentService?.refresh(for: info)
+        }
     }
 
     func respond(to id: String, with response: String) {
@@ -562,6 +588,234 @@ class EventMonitor: ObservableObject {
             self.events.removeAll { !$0.isPending }
             self.sessions.removeAll()
         }
+    }
+}
+
+// MARK: - Enrichment Service
+
+final class EnrichmentService: ObservableObject {
+    @Published private(set) var gitInfoByCwd: [String: GitInfo] = [:]
+
+    private let queue = DispatchQueue(label: "navi.enrichment", qos: .utility)
+    private var gitCache: [String: GitInfo] = [:]
+    private var pendingRefreshes: Set<String> = []
+    private var inFlightRefreshes: Set<String> = []
+    private var lastRefreshScheduledByCwd: [String: Date] = [:]
+    private var loggedOnce: Set<String> = []
+    private var gitAvailable: Bool = true
+
+    unowned let floatingManager: FloatingWindowManager
+
+    init(floatingManager: FloatingWindowManager) {
+        self.floatingManager = floatingManager
+    }
+
+    func refresh(for session: SessionInfo) {
+        guard floatingManager.anyEnrichmentToggleOn else { return }
+        let cwd = session.cwd
+        guard !cwd.isEmpty else { return }
+        scheduleGitRefresh(cwd: cwd)
+    }
+
+    func gitInfo(for cwd: String) -> GitInfo? {
+        var cached: GitInfo?
+        queue.sync {
+            cached = gitCache[cwd]
+        }
+        if let cached = cached, Date().timeIntervalSince(cached.fetchedAt) < 5 {
+            return cached
+        }
+        if floatingManager.anyEnrichmentToggleOn {
+            scheduleGitRefresh(cwd: cwd)
+        }
+        return cached
+    }
+
+    private func scheduleGitRefresh(cwd: String) {
+        queue.async { [weak self] in
+            guard let self = self else { return }
+            if self.pendingRefreshes.contains(cwd) || self.inFlightRefreshes.contains(cwd) {
+                return
+            }
+            if let last = self.lastRefreshScheduledByCwd[cwd],
+               Date().timeIntervalSince(last) < 0.5 {
+                self.pendingRefreshes.insert(cwd)
+                let delay = 0.5 - Date().timeIntervalSince(last)
+                self.queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+                    guard let self = self else { return }
+                    self.pendingRefreshes.remove(cwd)
+                    self.runGitRefresh(cwd: cwd)
+                }
+                return
+            }
+            self.runGitRefresh(cwd: cwd)
+        }
+    }
+
+    private func runGitRefresh(cwd: String) {
+        if inFlightRefreshes.contains(cwd) { return }
+        inFlightRefreshes.insert(cwd)
+        lastRefreshScheduledByCwd[cwd] = Date()
+        defer { inFlightRefreshes.remove(cwd) }
+
+        guard gitAvailable else { return }
+
+        guard let branchProbe = runProcess(executable: "git", args: ["-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"]) else {
+            return
+        }
+        if branchProbe.exitCode != 0 {
+            gitCache.removeValue(forKey: cwd)
+            DispatchQueue.main.async { [weak self] in
+                self?.gitInfoByCwd.removeValue(forKey: cwd)
+            }
+            return
+        }
+        let rawBranch = branchProbe.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        var branch = rawBranch
+        var isDetached = false
+        if rawBranch == "HEAD" {
+            isDetached = true
+            if let sha = runProcess(executable: "git", args: ["-C", cwd, "rev-parse", "--short", "HEAD"]),
+               sha.exitCode == 0 {
+                branch = sha.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+
+        var isDirty = false
+        if let status = runProcess(executable: "git", args: ["-C", cwd, "status", "--porcelain"]),
+           status.exitCode == 0 {
+            isDirty = !status.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+
+        var defaultBranch: String? = nil
+        if let head = runProcess(executable: "git", args: ["-C", cwd, "symbolic-ref", "refs/remotes/origin/HEAD", "--short"]),
+           head.exitCode == 0 {
+            let value = head.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+            if value.hasPrefix("origin/") {
+                defaultBranch = String(value.dropFirst("origin/".count))
+            } else if !value.isEmpty {
+                defaultBranch = value
+            }
+        }
+        if defaultBranch == nil,
+           let main = runProcess(executable: "git", args: ["-C", cwd, "show-ref", "--verify", "refs/heads/main"]),
+           main.exitCode == 0 {
+            defaultBranch = "main"
+        }
+        if defaultBranch == nil,
+           let master = runProcess(executable: "git", args: ["-C", cwd, "show-ref", "--verify", "refs/heads/master"]),
+           master.exitCode == 0 {
+            defaultBranch = "master"
+        }
+
+        var ahead: Int? = nil
+        var behind: Int? = nil
+        if !isDetached, let def = defaultBranch, def != branch {
+            if let counts = runProcess(executable: "git", args: ["-C", cwd, "rev-list", "--left-right", "--count", "\(branch)...\(def)"]),
+               counts.exitCode == 0 {
+                let parts = counts.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+                    .split(whereSeparator: { $0 == "\t" || $0 == " " })
+                if parts.count == 2,
+                   let leftCount = Int(parts[0]),
+                   let rightCount = Int(parts[1]) {
+                    ahead = leftCount
+                    behind = rightCount
+                }
+            }
+        } else if !isDetached, let def = defaultBranch, def == branch {
+            ahead = 0
+            behind = 0
+        }
+
+        let newInfo = GitInfo(
+            branch: branch,
+            isDirty: isDirty,
+            isDetached: isDetached,
+            ahead: ahead,
+            behind: behind,
+            defaultBranch: defaultBranch,
+            fetchedAt: Date()
+        )
+
+        let prevBranch = gitCache[cwd]?.branch
+        gitCache[cwd] = newInfo
+        if let prev = prevBranch, prev != newInfo.branch {
+            handleBranchSwitch(cwd: cwd, oldBranch: prev, newBranch: newInfo.branch)
+        }
+
+        DispatchQueue.main.async { [weak self] in
+            self?.gitInfoByCwd[cwd] = newInfo
+        }
+    }
+
+    private func handleBranchSwitch(cwd: String, oldBranch: String, newBranch: String) {
+        _ = (cwd, oldBranch, newBranch)
+    }
+
+    private func runProcess(executable: String, args: [String], timeout: TimeInterval = 2.0) -> (stdout: String, exitCode: Int32)? {
+        let process = Process()
+        let candidatePaths: [String]
+        if executable == "git" {
+            candidatePaths = ["/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git"]
+        } else if executable == "gh" {
+            candidatePaths = ["/opt/homebrew/bin/gh", "/usr/local/bin/gh", "/usr/bin/gh"]
+        } else {
+            candidatePaths = []
+        }
+
+        var resolvedPath: String? = nil
+        for path in candidatePaths where FileManager.default.isExecutableFile(atPath: path) {
+            resolvedPath = path
+            break
+        }
+
+        if let path = resolvedPath {
+            process.executableURL = URL(fileURLWithPath: path)
+            process.arguments = args
+        } else {
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            process.arguments = [executable] + args
+        }
+
+        var env = ProcessInfo.processInfo.environment
+        env["GH_PROMPT_DISABLED"] = "1"
+        process.environment = env
+
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        process.standardOutput = outPipe
+        process.standardError = errPipe
+
+        let semaphore = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in semaphore.signal() }
+
+        do {
+            try process.run()
+        } catch {
+            if executable == "git" {
+                if !loggedOnce.contains("git-not-found") {
+                    loggedOnce.insert("git-not-found")
+                    NSLog("[Navi] git not found on PATH; git enrichment disabled.")
+                }
+                gitAvailable = false
+            }
+            return nil
+        }
+
+        if semaphore.wait(timeout: .now() + timeout) == .timedOut {
+            process.terminate()
+            _ = semaphore.wait(timeout: .now() + 0.5)
+            if !loggedOnce.contains("timeout-\(executable)") {
+                loggedOnce.insert("timeout-\(executable)")
+                NSLog("[Navi] subprocess timeout: \(executable)")
+            }
+            return nil
+        }
+
+        let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+        _ = errPipe.fileHandleForReading.readDataToEndOfFile()
+        let stdout = String(data: outData, encoding: .utf8) ?? ""
+        return (stdout, process.terminationStatus)
     }
 }
 
@@ -859,11 +1113,13 @@ class MenuBarManager: NSObject, ObservableObject {
     private var popover: NSPopover?
     private var monitor: EventMonitor?
     private var floatingManager: FloatingWindowManager?
+    private var enrichmentService: EnrichmentService?
     private var eventObserver: Any?
 
-    func attach(monitor: EventMonitor, floatingManager: FloatingWindowManager) {
+    func attach(monitor: EventMonitor, floatingManager: FloatingWindowManager, enrichmentService: EnrichmentService) {
         self.monitor = monitor
         self.floatingManager = floatingManager
+        self.enrichmentService = enrichmentService
     }
 
     func enable() {
@@ -910,7 +1166,9 @@ class MenuBarManager: NSObject, ObservableObject {
             popover.performClose(nil)
             return
         }
-        guard let monitor = monitor, let floatingManager = floatingManager else { return }
+        guard let monitor = monitor,
+              let floatingManager = floatingManager,
+              let enrichmentService = enrichmentService else { return }
         // Reuse existing popover, create once
         if popover == nil {
             let pop = NSPopover()
@@ -919,7 +1177,7 @@ class MenuBarManager: NSObject, ObservableObject {
             pop.behavior = .transient
             pop.animates = true
             pop.contentViewController = NSHostingController(
-                rootView: ContentView(monitor: monitor, floatingManager: floatingManager)
+                rootView: ContentView(monitor: monitor, floatingManager: floatingManager, enrichmentService: enrichmentService)
             )
             popover = pop
         }
@@ -946,6 +1204,7 @@ private let autoLaunchFlagPath = "/tmp/navi/no-auto-launch"
 struct ContentView: View {
     @ObservedObject var monitor: EventMonitor
     @ObservedObject var floatingManager: FloatingWindowManager
+    @ObservedObject var enrichmentService: EnrichmentService
     var isFloatingWindow: Bool = false
     @State private var autoLaunch: Bool = !FileManager.default.fileExists(atPath: "/tmp/navi/no-auto-launch")
     @State private var permissionSoundOn: Bool = UserDefaults.standard.object(forKey: "NaviSound.permission") as? Bool ?? true
@@ -1362,7 +1621,7 @@ struct ContentView: View {
     private var sessionList: some View {
         VStack(spacing: 6) {
             ForEach(sessionGroups) { group in
-                SessionSection(group: group, monitor: monitor, floatingManager: floatingManager)
+                SessionSection(group: group, monitor: monitor, floatingManager: floatingManager, enrichmentService: enrichmentService)
             }
         }
         .padding(.vertical, 6)
@@ -1376,10 +1635,19 @@ private func headTruncated(_ path: String, max: Int) -> String {
     return "\u{2026}" + String(path.suffix(max - 1))
 }
 
+private func middleTruncated(_ s: String, max: Int) -> String {
+    if s.count <= max { return s }
+    let keep = max - 1
+    let prefixLen = keep - keep / 2
+    let suffixLen = keep - prefixLen
+    return String(s.prefix(prefixLen)) + "\u{2026}" + String(s.suffix(suffixLen))
+}
+
 struct SessionSection: View {
     let group: SessionGroup
     @ObservedObject var monitor: EventMonitor
     @ObservedObject var floatingManager: FloatingWindowManager
+    @ObservedObject var enrichmentService: EnrichmentService
     @State private var isExpanded = false
     @AppStorage("NaviFontScale") private var s: Double = 1.0
 
@@ -1470,6 +1738,36 @@ struct SessionSection: View {
                             .background(Color.primary.opacity(0.06))
                             .cornerRadius(4)
                             .help(group.info.cwd)
+                        }
+                        if floatingManager.showGitEnabled,
+                           let git = enrichmentService.gitInfoByCwd[group.info.cwd] {
+                            let bg: Color = {
+                                if git.isDetached { return Color.pastelGray.opacity(0.15) }
+                                if git.isDirty { return Color.pastelYellow.opacity(0.15) }
+                                return Color.pastelGreen.opacity(0.15)
+                            }()
+                            let display: String = {
+                                var text = middleTruncated(git.branch, max: 20)
+                                if !git.isDetached && git.isDirty { text += "*" }
+                                if !git.isDetached, git.defaultBranch != nil,
+                                   let a = git.ahead, a > 0 { text += "\u{2191}\(a)" }
+                                if !git.isDetached, git.defaultBranch != nil,
+                                   let b = git.behind, b > 0 { text += "\u{2193}\(b)" }
+                                return text
+                            }()
+                            HStack(spacing: 4) {
+                                Image(systemName: "arrow.triangle.branch")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Text(display)
+                                    .font(.caption)
+                                    .foregroundStyle(.primary)
+                            }
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(bg)
+                            .cornerRadius(4)
+                            .help(git.branch)
                         }
                     }
                     .padding(.horizontal, 10)
@@ -1725,14 +2023,22 @@ class NaviAppDelegate: NSObject, NSApplicationDelegate {
 struct NaviApp: App {
     @NSApplicationDelegateAdaptor(NaviAppDelegate.self) var appDelegate
     @StateObject private var monitor = EventMonitor()
-    @StateObject private var floatingManager = FloatingWindowManager()
+    @StateObject private var floatingManager: FloatingWindowManager
+    @StateObject private var enrichmentService: EnrichmentService
     private let menuBar = MenuBarManager()
+
+    init() {
+        let manager = FloatingWindowManager()
+        _floatingManager = StateObject(wrappedValue: manager)
+        _enrichmentService = StateObject(wrappedValue: EnrichmentService(floatingManager: manager))
+    }
 
     var body: some Scene {
         Window("Navi", id: "monitor") {
-            ContentView(monitor: monitor, floatingManager: floatingManager, isFloatingWindow: true)
+            ContentView(monitor: monitor, floatingManager: floatingManager, enrichmentService: enrichmentService, isFloatingWindow: true)
                 .onAppear {
-                    menuBar.attach(monitor: monitor, floatingManager: floatingManager)
+                    monitor.attach(enrichmentService: enrichmentService)
+                    menuBar.attach(monitor: monitor, floatingManager: floatingManager, enrichmentService: enrichmentService)
                     if floatingManager.menuBarEnabled { menuBar.enable() }
                 }
                 .onReceive(floatingManager.$menuBarEnabled) { on in
