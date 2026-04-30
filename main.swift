@@ -1055,7 +1055,9 @@ final class EnrichmentService: ObservableObject {
     }
 
     private func encodedProjectDir(forCwd cwd: String) -> String {
-        cwd.replacingOccurrences(of: "/", with: "-")
+        cwd
+            .replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: ".", with: "-")
     }
 
     private func readTranscriptTail(url: URL, maxBytes: Int = 65_536) -> [Data]? {
