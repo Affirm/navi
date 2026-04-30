@@ -136,11 +136,11 @@ let naviCurrentVersion = "1.1.3"
 // MARK: - Pastel Palette
 
 extension Color {
-    static let pastelGreen  = Color(hue: 0.33, saturation: 0.45, brightness: 0.85)
-    static let pastelYellow = Color(hue: 0.13, saturation: 0.45, brightness: 0.90)
-    static let pastelGray   = Color(hue: 0.00, saturation: 0.00, brightness: 0.75)
-    static let pastelBlue   = Color(hue: 0.58, saturation: 0.40, brightness: 0.90)
-    static let pastelPurple = Color(hue: 0.78, saturation: 0.40, brightness: 0.85)
+    static let pastelGreen  = Color(hue: 0.33, saturation: 0.38, brightness: 0.98)
+    static let pastelYellow = Color(hue: 0.13, saturation: 0.38, brightness: 1.00)
+    static let pastelGray   = Color(hue: 0.00, saturation: 0.00, brightness: 0.92)
+    static let pastelBlue   = Color(hue: 0.58, saturation: 0.32, brightness: 1.00)
+    static let pastelPurple = Color(hue: 0.78, saturation: 0.32, brightness: 0.98)
 }
 
 // MARK: - FlowLayout
@@ -2088,9 +2088,9 @@ struct SessionSection: View {
                         if floatingManager.showGitEnabled,
                            let git = enrichmentService.gitInfoByCwd[group.info.cwd] {
                             let bg: Color = {
-                                if git.isDetached { return Color.pastelGray.opacity(0.15) }
-                                if git.isDirty { return Color.pastelYellow.opacity(0.15) }
-                                return Color.pastelGreen.opacity(0.15)
+                                if git.isDetached { return Color.pastelGray.opacity(0.30) }
+                                if git.isDirty { return Color.pastelYellow.opacity(0.30) }
+                                return Color.pastelGreen.opacity(0.30)
                             }()
                             let display: String = {
                                 var text = middleTruncated(git.branch, max: 20)
@@ -2145,7 +2145,7 @@ struct SessionSection: View {
                                 .foregroundStyle(.primary)
                                 .padding(.horizontal, 6)
                                 .padding(.vertical, 2)
-                                .background(Color.pastelBlue.opacity(0.15))
+                                .background(Color.pastelBlue.opacity(0.30))
                                 .clipShape(Capsule())
                         }
                         if floatingManager.showModelEnabled,
@@ -2155,7 +2155,7 @@ struct SessionSection: View {
                                 .foregroundStyle(.primary)
                                 .padding(.horizontal, 6)
                                 .padding(.vertical, 2)
-                                .background(Color.pastelPurple.opacity(0.15))
+                                .background(Color.pastelPurple.opacity(0.30))
                                 .clipShape(Capsule())
                         }
                     }
