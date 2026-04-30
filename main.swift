@@ -2126,7 +2126,7 @@ struct SessionSection: View {
                                     Image(systemName: "arrow.up.forward.app")
                                         .font(.caption)
                                         .foregroundStyle(.tint)
-                                    Text("#\(pr.number)")
+                                    Text("#\(String(pr.number))")
                                         .font(.caption)
                                         .foregroundStyle(.tint)
                                 }
@@ -2136,7 +2136,7 @@ struct SessionSection: View {
                                 .cornerRadius(4)
                             }
                             .buttonStyle(.plain)
-                            .help("Open PR #\(pr.number) in browser")
+                            .help("Open PR #\(String(pr.number)) in browser")
                         }
                         if floatingManager.showModeEnabled,
                            let mode = enrichmentService.transcriptInfoBySid[group.info.id]?.permissionMode {
