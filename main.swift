@@ -33,6 +33,18 @@ func scaledFont(size: CGFloat, weight: Font.Weight = .regular, design: Font.Desi
 
 // MARK: - Helpers
 
+/// One-shot NSLog gate. The first call for a given key emits the message; subsequent
+/// calls with the same key are silently dropped. Owner must serialize access (e.g.
+/// confine to a single DispatchQueue).
+struct LoggedOnce {
+    private var keys: Set<String> = []
+    mutating func log(key: String, _ message: @autoclosure () -> String) {
+        guard !keys.contains(key) else { return }
+        keys.insert(key)
+        NSLog("%@", message())
+    }
+}
+
 private func relativeTime(from date: Date, to now: Date) -> String {
     let seconds = Int(now.timeIntervalSince(date))
     if seconds < 5 { return "now" }
@@ -121,6 +133,114 @@ func focusTerminal(tty: String) {
 
 let naviCurrentVersion = "1.1.3"
 
+// MARK: - Pastel Palette
+
+extension Color {
+    static let pastelGreen  = Color(hue: 0.33, saturation: 0.38, brightness: 0.98)
+    static let pastelYellow = Color(hue: 0.13, saturation: 0.38, brightness: 1.00)
+    static let pastelGray   = Color(hue: 0.00, saturation: 0.00, brightness: 0.92)
+    static let pastelBlue   = Color(hue: 0.58, saturation: 0.32, brightness: 1.00)
+    static let pastelPurple = Color(hue: 0.78, saturation: 0.32, brightness: 0.98)
+}
+
+// MARK: - FlowLayout
+
+struct FlowLayout: Layout {
+    var spacing: CGFloat = 6
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        guard !subviews.isEmpty else { return .zero }
+        let maxWidth = proposal.width ?? .infinity
+        var rowWidth: CGFloat = 0
+        var rowHeight: CGFloat = 0
+        var totalHeight: CGFloat = 0
+        var maxRowWidth: CGFloat = 0
+
+        for subview in subviews {
+            let size = subview.sizeThatFits(.unspecified)
+            let proposedRowWidth = rowWidth == 0 ? size.width : rowWidth + spacing + size.width
+            if proposedRowWidth > maxWidth && rowWidth > 0 {
+                maxRowWidth = max(maxRowWidth, rowWidth)
+                totalHeight += rowHeight + spacing
+                rowWidth = size.width
+                rowHeight = size.height
+            } else {
+                rowWidth = proposedRowWidth
+                rowHeight = max(rowHeight, size.height)
+            }
+        }
+        maxRowWidth = max(maxRowWidth, rowWidth)
+        totalHeight += rowHeight
+        return CGSize(width: maxRowWidth, height: totalHeight)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        guard !subviews.isEmpty else { return }
+        let maxWidth = bounds.width
+        var x = bounds.minX
+        var y = bounds.minY
+        var rowHeight: CGFloat = 0
+
+        for subview in subviews {
+            let size = subview.sizeThatFits(.unspecified)
+            if x + size.width > bounds.minX + maxWidth && x > bounds.minX {
+                x = bounds.minX
+                y += rowHeight + spacing
+                rowHeight = 0
+            }
+            subview.place(at: CGPoint(x: x, y: y), anchor: .topLeading, proposal: ProposedViewSize(size))
+            x += size.width + spacing
+            rowHeight = max(rowHeight, size.height)
+        }
+    }
+}
+
+// MARK: - Enrichment Data Model
+
+struct GitInfo: Equatable {
+    let branch: String
+    let isDirty: Bool
+    let isDetached: Bool
+    let ahead: Int?
+    let behind: Int?
+    let defaultBranch: String?
+    let fetchedAt: Date
+
+    // Equality ignores fetchedAt so SwiftUI does not re-render every refresh when
+    // the data the badge displays has not actually changed.
+    static func == (lhs: GitInfo, rhs: GitInfo) -> Bool {
+        lhs.branch == rhs.branch
+            && lhs.isDirty == rhs.isDirty
+            && lhs.isDetached == rhs.isDetached
+            && lhs.ahead == rhs.ahead
+            && lhs.behind == rhs.behind
+            && lhs.defaultBranch == rhs.defaultBranch
+    }
+}
+
+struct TranscriptInfo: Equatable {
+    let model: String?
+    let permissionMode: String?
+    let fetchedAt: Date
+
+    // Equality ignores fetchedAt so SwiftUI does not re-render when only the
+    // refresh timestamp changes; values are what the UI actually depends on.
+    static func == (lhs: TranscriptInfo, rhs: TranscriptInfo) -> Bool {
+        lhs.model == rhs.model && lhs.permissionMode == rhs.permissionMode
+    }
+}
+
+struct PRInfo: Equatable {
+    let number: Int
+    let url: URL
+    let branch: String
+    let fetchedAt: Date
+
+    static func == (lhs: PRInfo, rhs: PRInfo) -> Bool {
+        lhs.number == rhs.number && lhs.url == rhs.url && lhs.branch == rhs.branch
+    }
+}
+
 // MARK: - Model
 
 struct NaviEvent: Identifiable {
@@ -191,6 +311,14 @@ class EventMonitor: ObservableObject {
     private var knownIDs = Set<String>()
     private var timer: Timer?
     private var dirSource: DispatchSourceFileSystemObject?
+    weak var enrichmentService: EnrichmentService?
+
+    func attach(enrichmentService: EnrichmentService) {
+        self.enrichmentService = enrichmentService
+        for info in sessions.values {
+            enrichmentService.refresh(for: info)
+        }
+    }
 
     init() {
         let fm = FileManager.default
@@ -434,6 +562,9 @@ class EventMonitor: ObservableObject {
                 pid: pid_t(pid),
                 lastActivity: Date()
             )
+            if let info = sessions[sid] {
+                enrichmentService?.refresh(for: info)
+            }
         }
     }
 
@@ -469,6 +600,9 @@ class EventMonitor: ObservableObject {
             // Always update session name — it can change via /rename
             sessions[sid]!.sessionName = event.sessionName
         }
+        if let info = sessions[sid] {
+            enrichmentService?.refresh(for: info)
+        }
     }
 
     func respond(to id: String, with response: String) {
@@ -500,6 +634,527 @@ class EventMonitor: ObservableObject {
             self.events.removeAll { !$0.isPending }
             self.sessions.removeAll()
         }
+    }
+}
+
+// MARK: - Enrichment Service
+
+final class EnrichmentService: ObservableObject {
+    @Published private(set) var gitInfoByCwd: [String: GitInfo] = [:]
+    @Published private(set) var transcriptInfoBySid: [String: TranscriptInfo] = [:]
+    @Published private(set) var prInfoByCwdBranch: [String: PRInfo] = [:]
+
+    private let queue = DispatchQueue(label: "navi.enrichment", qos: .utility)
+    private var gitCache: [String: GitInfo] = [:]
+    private var pendingRefreshes: Set<String> = []
+    private var inFlightRefreshes: Set<String> = []
+    private var lastRefreshScheduledByCwd: [String: Date] = [:]
+    private var logged = LoggedOnce()
+    private var gitAvailable: Bool = true
+
+    private var transcriptCache: [String: TranscriptInfo] = [:]
+    private var pendingTranscriptRefreshes: Set<String> = []
+    private var inFlightTranscriptRefreshes: Set<String> = []
+    private var lastTranscriptRefreshBySid: [String: Date] = [:]
+
+    private var prCache: [String: PRInfo] = [:]
+    private var pendingPRRefreshes: Set<String> = []
+    private var inFlightPRRefreshes: Set<String> = []
+    private var lastPRRefreshByKey: [String: Date] = [:]
+    private var ghAvailable: Bool = false
+    private var ghProbeDone: Bool = false
+
+    unowned let floatingManager: FloatingWindowManager
+
+    init(floatingManager: FloatingWindowManager) {
+        self.floatingManager = floatingManager
+    }
+
+    static func prKey(cwd: String, branch: String) -> String {
+        "\(cwd)\u{1f}\(branch)"
+    }
+
+    func refresh(for session: SessionInfo) {
+        guard floatingManager.anyEnrichmentToggleOn else { return }
+        let cwd = session.cwd
+        guard !cwd.isEmpty else { return }
+        scheduleGitRefresh(cwd: cwd)
+        if floatingManager.showModeEnabled || floatingManager.showModelEnabled,
+           !session.id.isEmpty {
+            scheduleTranscriptRefresh(sessionID: session.id, cwd: cwd)
+        }
+    }
+
+    private func scheduleGitRefresh(cwd: String) {
+        queue.async { [weak self] in
+            guard let self = self else { return }
+            if self.pendingRefreshes.contains(cwd) || self.inFlightRefreshes.contains(cwd) {
+                return
+            }
+            // AC-24: enforce 5s TTL — within 5s of a successful refresh, return cached value
+            // without spawning git subprocesses. Mirrors PR cache TTL at schedulePRRefresh.
+            if let cached = self.gitCache[cwd],
+               Date().timeIntervalSince(cached.fetchedAt) < 5.0 {
+                return
+            }
+            if let last = self.lastRefreshScheduledByCwd[cwd],
+               Date().timeIntervalSince(last) < 0.5 {
+                self.pendingRefreshes.insert(cwd)
+                let delay = 0.5 - Date().timeIntervalSince(last)
+                self.queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+                    guard let self = self else { return }
+                    self.pendingRefreshes.remove(cwd)
+                    self.runGitRefresh(cwd: cwd)
+                }
+                return
+            }
+            self.runGitRefresh(cwd: cwd)
+        }
+    }
+
+    private func runGitRefresh(cwd: String) {
+        // Defensive on-queue reentrancy guard; matches the PR/transcript refresh shape.
+        if inFlightRefreshes.contains(cwd) { return }
+        inFlightRefreshes.insert(cwd)
+        lastRefreshScheduledByCwd[cwd] = Date()
+        defer { inFlightRefreshes.remove(cwd) }
+
+        guard gitAvailable else { return }
+
+        guard let branchProbe = runProcess(executable: "git", args: ["-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"]) else {
+            return
+        }
+        if branchProbe.exitCode != 0 {
+            gitCache.removeValue(forKey: cwd)
+            DispatchQueue.main.async { [weak self] in
+                self?.gitInfoByCwd.removeValue(forKey: cwd)
+            }
+            return
+        }
+        let rawBranch = branchProbe.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        var branch = rawBranch
+        var isDetached = false
+        if rawBranch == "HEAD" {
+            isDetached = true
+            if let sha = runProcess(executable: "git", args: ["-C", cwd, "rev-parse", "--short", "HEAD"]),
+               sha.exitCode == 0 {
+                branch = sha.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+
+        var isDirty = false
+        if let status = runProcess(executable: "git", args: ["-C", cwd, "status", "--porcelain"]),
+           status.exitCode == 0 {
+            isDirty = !status.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+
+        var defaultBranch: String? = nil
+        if let head = runProcess(executable: "git", args: ["-C", cwd, "symbolic-ref", "refs/remotes/origin/HEAD", "--short"]),
+           head.exitCode == 0 {
+            let value = head.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+            if value.hasPrefix("origin/") {
+                defaultBranch = String(value.dropFirst("origin/".count))
+            } else if !value.isEmpty {
+                defaultBranch = value
+            }
+        }
+        if defaultBranch == nil,
+           let main = runProcess(executable: "git", args: ["-C", cwd, "show-ref", "--verify", "refs/heads/main"]),
+           main.exitCode == 0 {
+            defaultBranch = "main"
+        }
+        if defaultBranch == nil,
+           let master = runProcess(executable: "git", args: ["-C", cwd, "show-ref", "--verify", "refs/heads/master"]),
+           master.exitCode == 0 {
+            defaultBranch = "master"
+        }
+
+        var ahead: Int? = nil
+        var behind: Int? = nil
+        if !isDetached, let def = defaultBranch, def != branch {
+            if let counts = runProcess(executable: "git", args: ["-C", cwd, "rev-list", "--left-right", "--count", "\(branch)...\(def)"]),
+               counts.exitCode == 0 {
+                let parts = counts.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+                    .split(whereSeparator: { $0 == "\t" || $0 == " " })
+                if parts.count == 2,
+                   let leftCount = Int(parts[0]),
+                   let rightCount = Int(parts[1]) {
+                    ahead = leftCount
+                    behind = rightCount
+                }
+            }
+        } else if !isDetached, let def = defaultBranch, def == branch {
+            ahead = 0
+            behind = 0
+        }
+
+        let newInfo = GitInfo(
+            branch: branch,
+            isDirty: isDirty,
+            isDetached: isDetached,
+            ahead: ahead,
+            behind: behind,
+            defaultBranch: defaultBranch,
+            fetchedAt: Date()
+        )
+
+        let prevBranch = gitCache[cwd]?.branch
+        gitCache[cwd] = newInfo
+        if let prev = prevBranch, prev != newInfo.branch {
+            handleBranchSwitch(cwd: cwd, oldBranch: prev)
+        }
+
+        DispatchQueue.main.async { [weak self] in
+            self?.gitInfoByCwd[cwd] = newInfo
+        }
+
+        if floatingManager.showGitEnabled,
+           !newInfo.isDetached, !newInfo.branch.isEmpty {
+            schedulePRRefresh(cwd: cwd, branch: newInfo.branch)
+        }
+    }
+
+    private func handleBranchSwitch(cwd: String, oldBranch: String) {
+        invalidatePRCache(cwd: cwd, branch: oldBranch)
+    }
+
+    private func probeGhAvailability() {
+        guard !ghProbeDone else { return }
+        ghProbeDone = true
+
+        let candidatePaths = ["/opt/homebrew/bin/gh", "/usr/local/bin/gh", "/usr/bin/gh"]
+        let installed = candidatePaths.contains { FileManager.default.isExecutableFile(atPath: $0) }
+        if !installed {
+            ghAvailable = false
+            logged.log(key: "gh-not-found", "[Navi] gh not found on PATH; PR enrichment disabled.")
+            return
+        }
+
+        guard let auth = runProcess(executable: "gh", args: ["auth", "status"]) else {
+            ghAvailable = false
+            logged.log(key: "gh-auth-failed", "[Navi] gh authentication failed; PR enrichment disabled.")
+            return
+        }
+        if auth.exitCode == 0 {
+            ghAvailable = true
+        } else {
+            ghAvailable = false
+            logged.log(key: "gh-auth-failed", "[Navi] gh authentication failed; PR enrichment disabled.")
+        }
+    }
+
+    private func schedulePRRefresh(cwd: String, branch: String) {
+        let key = Self.prKey(cwd: cwd, branch: branch)
+        queue.async { [weak self] in
+            guard let self = self else { return }
+            if !self.ghProbeDone {
+                self.probeGhAvailability()
+            }
+            guard self.ghAvailable else { return }
+            if self.pendingPRRefreshes.contains(key) || self.inFlightPRRefreshes.contains(key) {
+                return
+            }
+            if let cached = self.prCache[key],
+               Date().timeIntervalSince(cached.fetchedAt) < 60 {
+                return
+            }
+            if let last = self.lastPRRefreshByKey[key],
+               Date().timeIntervalSince(last) < 0.5 {
+                self.pendingPRRefreshes.insert(key)
+                let delay = 0.5 - Date().timeIntervalSince(last)
+                self.queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+                    guard let self = self else { return }
+                    self.pendingPRRefreshes.remove(key)
+                    self.runPRRefresh(cwd: cwd, branch: branch)
+                }
+                return
+            }
+            self.runPRRefresh(cwd: cwd, branch: branch)
+        }
+    }
+
+    private func runPRRefresh(cwd: String, branch: String) {
+        guard ghAvailable else { return }
+        if branch.isEmpty || branch == "HEAD" { return }
+
+        let key = Self.prKey(cwd: cwd, branch: branch)
+        if inFlightPRRefreshes.contains(key) { return }
+        inFlightPRRefreshes.insert(key)
+        lastPRRefreshByKey[key] = Date()
+        // runs synchronously on the serial queue, so defer is safe.
+        defer { inFlightPRRefreshes.remove(key) }
+
+        guard let result = runProcess(
+            executable: "gh",
+            args: ["pr", "list", "--head", branch, "--state", "open", "--json", "number,url", "--limit", "1"],
+            cwd: cwd
+        ) else {
+            return
+        }
+
+        if result.exitCode != 0 {
+            logged.log(key: "gh-pr-list-failed", "[Navi] gh pr list failed; preserving cached PR data.")
+            return
+        }
+
+        guard let data = result.stdout.data(using: .utf8),
+              let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            return
+        }
+
+        if arr.isEmpty {
+            if prCache.removeValue(forKey: key) != nil {
+                DispatchQueue.main.async { [weak self] in
+                    self?.prInfoByCwdBranch.removeValue(forKey: key)
+                }
+            }
+            return
+        }
+
+        guard let first = arr.first,
+              let number = first["number"] as? Int,
+              let urlString = first["url"] as? String,
+              let url = URL(string: urlString) else {
+            return
+        }
+
+        let newInfo = PRInfo(number: number, url: url, branch: branch, fetchedAt: Date())
+        let existing = prCache[key]
+        if existing == newInfo { return }
+        prCache[key] = newInfo
+        DispatchQueue.main.async { [weak self] in
+            self?.prInfoByCwdBranch[key] = newInfo
+        }
+    }
+
+    private func invalidatePRCache(cwd: String, branch: String) {
+        let key = Self.prKey(cwd: cwd, branch: branch)
+        if prCache.removeValue(forKey: key) != nil {
+            DispatchQueue.main.async { [weak self] in
+                self?.prInfoByCwdBranch.removeValue(forKey: key)
+            }
+        }
+        pendingPRRefreshes.remove(key)
+        lastPRRefreshByKey.removeValue(forKey: key)
+    }
+
+    private func scheduleTranscriptRefresh(sessionID: String, cwd: String) {
+        queue.async { [weak self] in
+            guard let self = self else { return }
+            if self.pendingTranscriptRefreshes.contains(sessionID) ||
+               self.inFlightTranscriptRefreshes.contains(sessionID) {
+                return
+            }
+            if let last = self.lastTranscriptRefreshBySid[sessionID],
+               Date().timeIntervalSince(last) < 0.5 {
+                self.pendingTranscriptRefreshes.insert(sessionID)
+                let delay = 0.5 - Date().timeIntervalSince(last)
+                self.queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+                    guard let self = self else { return }
+                    self.pendingTranscriptRefreshes.remove(sessionID)
+                    self.runTranscriptRefresh(sessionID: sessionID, cwd: cwd)
+                }
+                return
+            }
+            self.runTranscriptRefresh(sessionID: sessionID, cwd: cwd)
+        }
+    }
+
+    private func runTranscriptRefresh(sessionID: String, cwd: String) {
+        if inFlightTranscriptRefreshes.contains(sessionID) { return }
+        inFlightTranscriptRefreshes.insert(sessionID)
+        lastTranscriptRefreshBySid[sessionID] = Date()
+        defer { inFlightTranscriptRefreshes.remove(sessionID) }
+
+        guard let url = transcriptURL(forSessionID: sessionID, cwd: cwd) else {
+            if transcriptCache.removeValue(forKey: sessionID) != nil {
+                DispatchQueue.main.async { [weak self] in
+                    self?.transcriptInfoBySid.removeValue(forKey: sessionID)
+                }
+            }
+            return
+        }
+
+        guard let lines = readTranscriptTail(url: url) else {
+            if transcriptCache.removeValue(forKey: sessionID) != nil {
+                DispatchQueue.main.async { [weak self] in
+                    self?.transcriptInfoBySid.removeValue(forKey: sessionID)
+                }
+            }
+            return
+        }
+
+        var model: String? = nil
+        var permissionMode: String? = nil
+        var consecutiveParseFailures = 0
+        var maxConsecutiveFailures = 0
+        for line in lines.reversed() {
+            if model != nil && permissionMode != nil { break }
+            guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else {
+                consecutiveParseFailures += 1
+                maxConsecutiveFailures = max(maxConsecutiveFailures, consecutiveParseFailures)
+                continue
+            }
+            consecutiveParseFailures = 0
+            if model == nil,
+               let message = obj["message"] as? [String: Any],
+               (message["role"] as? String) == "assistant",
+               let m = message["model"] as? String, !m.isEmpty {
+                model = m
+            }
+            if permissionMode == nil {
+                if let pm = obj["permissionMode"] as? String, !pm.isEmpty {
+                    permissionMode = pm
+                } else if let message = obj["message"] as? [String: Any],
+                          let pm = message["permissionMode"] as? String, !pm.isEmpty {
+                    permissionMode = pm
+                }
+            }
+        }
+        if maxConsecutiveFailures >= 3 {
+            logged.log(
+                key: "transcript-parse-error-\(sessionID)",
+                "[Navi] transcript parse error for session \(sessionID): \(maxConsecutiveFailures) consecutive lines failed to parse"
+            )
+        }
+
+        let existing = transcriptCache[sessionID]
+        if model == nil && permissionMode == nil && existing == nil {
+            return
+        }
+
+        let newInfo = TranscriptInfo(model: model, permissionMode: permissionMode, fetchedAt: Date())
+        if existing == newInfo { return }
+        transcriptCache[sessionID] = newInfo
+        DispatchQueue.main.async { [weak self] in
+            self?.transcriptInfoBySid[sessionID] = newInfo
+        }
+    }
+
+    private func transcriptURL(forSessionID sessionID: String, cwd: String) -> URL? {
+        let projectsRoot = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude/projects", isDirectory: true)
+        let direct = projectsRoot
+            .appendingPathComponent(encodedProjectDir(forCwd: cwd), isDirectory: true)
+            .appendingPathComponent("\(sessionID).jsonl", isDirectory: false)
+        if FileManager.default.fileExists(atPath: direct.path) { return direct }
+
+        // Fallback: scan one level under ~/.claude/projects/ for <sessionID>.jsonl.
+        let fm = FileManager.default
+        guard let entries = try? fm.contentsOfDirectory(at: projectsRoot,
+                                                       includingPropertiesForKeys: [.isDirectoryKey],
+                                                       options: [.skipsHiddenFiles])
+        else { return nil }
+        for dir in entries {
+            var isDir: ObjCBool = false
+            guard fm.fileExists(atPath: dir.path, isDirectory: &isDir), isDir.boolValue else { continue }
+            let candidate = dir.appendingPathComponent("\(sessionID).jsonl", isDirectory: false)
+            if fm.fileExists(atPath: candidate.path) { return candidate }
+        }
+        return nil
+    }
+
+    private func encodedProjectDir(forCwd cwd: String) -> String {
+        cwd
+            .replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: ".", with: "-")
+    }
+
+    private func readTranscriptTail(url: URL, maxBytes: Int = 65_536) -> [Data]? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        let fileSize = (try? handle.seekToEnd()) ?? 0
+        guard fileSize > 0 else { return nil }
+        let start = fileSize > UInt64(maxBytes) ? fileSize - UInt64(maxBytes) : 0
+        do { try handle.seek(toOffset: start) } catch { return nil }
+        var data = handle.readDataToEndOfFile()
+        if data.isEmpty { return nil }
+
+        if start > 0 {
+            guard let firstNewline = data.firstIndex(of: 0x0A) else { return nil }
+            data = data.subdata(in: data.index(after: firstNewline)..<data.endIndex)
+        }
+
+        // Swift 6.3 has an ambiguous Sequence/Collection split overload on Data;
+        // build the result manually to sidestep it.
+        var lines: [Data] = []
+        var lineStart = data.startIndex
+        for i in data.indices {
+            if data[i] == 0x0A {
+                if i > lineStart {
+                    lines.append(data.subdata(in: lineStart..<i))
+                }
+                lineStart = data.index(after: i)
+            }
+        }
+        if lineStart < data.endIndex {
+            lines.append(data.subdata(in: lineStart..<data.endIndex))
+        }
+        return lines
+    }
+
+    private func runProcess(executable: String, args: [String], cwd: String? = nil, timeout: TimeInterval = 2.0) -> (stdout: String, exitCode: Int32)? {
+        let process = Process()
+        let candidatePaths: [String]
+        if executable == "git" {
+            candidatePaths = ["/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git"]
+        } else if executable == "gh" {
+            candidatePaths = ["/opt/homebrew/bin/gh", "/usr/local/bin/gh", "/usr/bin/gh"]
+        } else {
+            candidatePaths = []
+        }
+
+        var resolvedPath: String? = nil
+        for path in candidatePaths where FileManager.default.isExecutableFile(atPath: path) {
+            resolvedPath = path
+            break
+        }
+
+        if let path = resolvedPath {
+            process.executableURL = URL(fileURLWithPath: path)
+            process.arguments = args
+        } else {
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            process.arguments = [executable] + args
+        }
+
+        if let cwd = cwd, !cwd.isEmpty {
+            process.currentDirectoryURL = URL(fileURLWithPath: cwd)
+        }
+
+        var env = ProcessInfo.processInfo.environment
+        env["GH_PROMPT_DISABLED"] = "1"
+        process.environment = env
+
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        process.standardOutput = outPipe
+        process.standardError = errPipe
+
+        let semaphore = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in semaphore.signal() }
+
+        do {
+            try process.run()
+        } catch {
+            if executable == "git" {
+                logged.log(key: "git-not-found", "[Navi] git not found on PATH; git enrichment disabled.")
+                gitAvailable = false
+            }
+            return nil
+        }
+
+        if semaphore.wait(timeout: .now() + timeout) == .timedOut {
+            process.terminate()
+            _ = semaphore.wait(timeout: .now() + 0.5)
+            logged.log(key: "subprocess-timeout-\(executable)", "[Navi] subprocess timeout: \(executable)")
+            return nil
+        }
+
+        let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+        _ = errPipe.fileHandleForReading.readDataToEndOfFile()
+        let stdout = String(data: outData, encoding: .utf8) ?? ""
+        return (stdout, process.terminationStatus)
     }
 }
 
@@ -622,6 +1277,35 @@ class FloatingWindowManager: ObservableObject {
         }
     }
 
+    @Published var showFolderEnabled: Bool {
+        didSet { UserDefaults.standard.set(showFolderEnabled, forKey: "NaviExp.ShowFolder") }
+    }
+
+    @Published var showGitEnabled: Bool {
+        didSet { UserDefaults.standard.set(showGitEnabled, forKey: "NaviExp.ShowGit") }
+    }
+
+    @Published var showModeEnabled: Bool {
+        didSet { UserDefaults.standard.set(showModeEnabled, forKey: "NaviExp.ShowMode") }
+    }
+
+    @Published var showModelEnabled: Bool {
+        didSet { UserDefaults.standard.set(showModelEnabled, forKey: "NaviExp.ShowModel") }
+    }
+
+    var anyEnrichmentToggleOn: Bool {
+        showFolderEnabled || showGitEnabled || showModeEnabled || showModelEnabled
+    }
+
+    var computedWindowWidth: CGFloat {
+        switch (anyEnrichmentToggleOn, detailedPermissionsEnabled) {
+        case (false, false): return 360
+        case (false, true):  return 520
+        case (true,  false): return 480
+        case (true,  true):  return 560
+        }
+    }
+
     /// Set to true when a feature that requires a Navi restart is toggled.
     /// The UI observes this to show a restart prompt.
     @Published var pendingRestart = false
@@ -739,6 +1423,10 @@ class FloatingWindowManager: ObservableObject {
             sessionStatusEnabled = UserDefaults.standard.bool(forKey: "NaviExp.SessionStatus")
         }
         detailedPermissionsEnabled = UserDefaults.standard.bool(forKey: "NaviExp.DetailedPermissions")
+        showFolderEnabled = UserDefaults.standard.bool(forKey: "NaviExp.ShowFolder")
+        showGitEnabled = UserDefaults.standard.bool(forKey: "NaviExp.ShowGit")
+        showModeEnabled = UserDefaults.standard.bool(forKey: "NaviExp.ShowMode")
+        showModelEnabled = UserDefaults.standard.bool(forKey: "NaviExp.ShowModel")
 
         // Show a session restart hint after a plugin version upgrade
         let lastVersion = UserDefaults.standard.string(forKey: "NaviLastVersion") ?? ""
@@ -764,11 +1452,13 @@ class MenuBarManager: NSObject, ObservableObject {
     private var popover: NSPopover?
     private var monitor: EventMonitor?
     private var floatingManager: FloatingWindowManager?
+    private var enrichmentService: EnrichmentService?
     private var eventObserver: Any?
 
-    func attach(monitor: EventMonitor, floatingManager: FloatingWindowManager) {
+    func attach(monitor: EventMonitor, floatingManager: FloatingWindowManager, enrichmentService: EnrichmentService) {
         self.monitor = monitor
         self.floatingManager = floatingManager
+        self.enrichmentService = enrichmentService
     }
 
     func enable() {
@@ -815,16 +1505,18 @@ class MenuBarManager: NSObject, ObservableObject {
             popover.performClose(nil)
             return
         }
-        guard let monitor = monitor, let floatingManager = floatingManager else { return }
+        guard let monitor = monitor,
+              let floatingManager = floatingManager,
+              let enrichmentService = enrichmentService else { return }
         // Reuse existing popover, create once
         if popover == nil {
             let pop = NSPopover()
-            let width: CGFloat = floatingManager.detailedPermissionsEnabled ? 520 : 360
+            let width: CGFloat = floatingManager.computedWindowWidth
             pop.contentSize = NSSize(width: width, height: 500)
             pop.behavior = .transient
             pop.animates = true
             pop.contentViewController = NSHostingController(
-                rootView: ContentView(monitor: monitor, floatingManager: floatingManager)
+                rootView: ContentView(monitor: monitor, floatingManager: floatingManager, enrichmentService: enrichmentService)
             )
             popover = pop
         }
@@ -851,6 +1543,7 @@ private let autoLaunchFlagPath = "/tmp/navi/no-auto-launch"
 struct ContentView: View {
     @ObservedObject var monitor: EventMonitor
     @ObservedObject var floatingManager: FloatingWindowManager
+    @ObservedObject var enrichmentService: EnrichmentService
     var isFloatingWindow: Bool = false
     @State private var autoLaunch: Bool = !FileManager.default.fileExists(atPath: "/tmp/navi/no-auto-launch")
     @State private var permissionSoundOn: Bool = UserDefaults.standard.object(forKey: "NaviSound.permission") as? Bool ?? true
@@ -899,7 +1592,7 @@ struct ContentView: View {
                 sessionList
             }
         }
-        .frame(width: floatingManager.detailedPermissionsEnabled ? 520 : 360)
+        .frame(width: floatingManager.computedWindowWidth)
         .overlay(
             Group {
                 if isFloatingWindow {
@@ -1132,6 +1825,23 @@ struct ContentView: View {
             experimentalRow("Detailed permissions", subtitle: "Show the full tool input for permission requests. Widens the Navi window.",
                 isOn: Binding(get: { floatingManager.detailedPermissionsEnabled }, set: { floatingManager.detailedPermissionsEnabled = $0 }))
 
+            Text("Session details")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .padding(.top, 4)
+
+            experimentalRow("Folder path", subtitle: "Show the working directory for each session.",
+                isOn: Binding(get: { floatingManager.showFolderEnabled }, set: { floatingManager.showFolderEnabled = $0 }))
+
+            experimentalRow("Git status", subtitle: "Show branch, dirty state, and any open PR for each session.",
+                isOn: Binding(get: { floatingManager.showGitEnabled }, set: { floatingManager.showGitEnabled = $0 }))
+
+            experimentalRow("Claude mode", subtitle: "Show the active permission mode (plan, auto, acceptEdits, bypassPermissions).",
+                isOn: Binding(get: { floatingManager.showModeEnabled }, set: { floatingManager.showModeEnabled = $0 }))
+
+            experimentalRow("Claude model", subtitle: "Show the model used by each session (e.g. opus-4-7, sonnet-4-6).",
+                isOn: Binding(get: { floatingManager.showModelEnabled }, set: { floatingManager.showModelEnabled = $0 }))
+
             if floatingManager.pendingRestart {
                 restartBanner
             }
@@ -1250,7 +1960,7 @@ struct ContentView: View {
     private var sessionList: some View {
         VStack(spacing: 6) {
             ForEach(sessionGroups) { group in
-                SessionSection(group: group, monitor: monitor, floatingManager: floatingManager)
+                SessionSection(group: group, monitor: monitor, floatingManager: floatingManager, enrichmentService: enrichmentService)
             }
         }
         .padding(.vertical, 6)
@@ -1259,10 +1969,31 @@ struct ContentView: View {
 
 // MARK: - Session Section
 
+private func headTruncated(_ path: String, max: Int) -> String {
+    if path.count <= max { return path }
+    return "\u{2026}" + String(path.suffix(max - 1))
+}
+
+private func middleTruncated(_ s: String, max: Int) -> String {
+    if s.count <= max { return s }
+    let keep = max - 1
+    let prefixLen = keep - keep / 2
+    let suffixLen = keep - prefixLen
+    return String(s.prefix(prefixLen)) + "\u{2026}" + String(s.suffix(suffixLen))
+}
+
+private func shortModel(_ raw: String) -> String {
+    var s = raw
+    if s.hasPrefix("claude-") { s = String(s.dropFirst("claude-".count)) }
+    if s.lowercased().hasSuffix("-1m") { s = String(s.dropLast(3)) }
+    return s
+}
+
 struct SessionSection: View {
     let group: SessionGroup
     @ObservedObject var monitor: EventMonitor
     @ObservedObject var floatingManager: FloatingWindowManager
+    @ObservedObject var enrichmentService: EnrichmentService
     @State private var isExpanded = false
     @AppStorage("NaviFontScale") private var s: Double = 1.0
 
@@ -1273,67 +2004,164 @@ struct SessionSection: View {
     var body: some View {
         VStack(spacing: 0) {
             // Session header
-            HStack(spacing: 0) {
-                Button { withAnimation(.easeInOut(duration: 0.2)) { isExpanded.toggle() } } label: {
-                    HStack(spacing: 6) {
-                        Image(systemName: group.status.icon)
-                            .foregroundStyle(group.status.color)
-                            .font(.system(size: 13 * s))
-
-                        Image(systemName: "folder.fill")
-                            .foregroundStyle(.secondary)
-                            .font(.system(size: 11 * s))
-                        Text(group.info.displayName)
-                            .font(.system(size: 13 * s, weight: .semibold))
-
-                        Text(group.info.shortSession)
-                            .font(.system(size: 11 * s, design: .monospaced))
-                            .foregroundStyle(.tertiary)
-
-                        Spacer()
-
-                        if !group.status.label.isEmpty {
-                            Text(group.status.label)
-                                .font(.system(size: 11 * s, weight: .medium))
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 0) {
+                    Button { withAnimation(.easeInOut(duration: 0.2)) { isExpanded.toggle() } } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: group.status.icon)
                                 .foregroundStyle(group.status.color)
-                        }
+                                .font(.system(size: 13 * s))
 
-                        TimelineView(.periodic(from: .now, by: 1)) { context in
-                            Text(relativeTime(from: group.info.lastActivity, to: context.date))
+                            Image(systemName: "folder.fill")
+                                .foregroundStyle(.secondary)
                                 .font(.system(size: 11 * s))
-                                .foregroundStyle(.tertiary)
-                        }
+                            Text(group.info.displayName)
+                                .font(.system(size: 13 * s, weight: .semibold))
 
-                        if !group.events.isEmpty {
-                            Image(systemName: "chevron.right")
-                                .font(.system(size: 10 * s, weight: .bold))
+                            Text(group.info.shortSession)
+                                .font(.system(size: 11 * s, design: .monospaced))
                                 .foregroundStyle(.tertiary)
-                                .rotationEffect(.degrees(isExpanded ? 90 : 0))
+
+                            Spacer()
+
+                            if !group.status.label.isEmpty {
+                                Text(group.status.label)
+                                    .font(.system(size: 11 * s, weight: .medium))
+                                    .foregroundStyle(group.status.color)
+                            }
+
+                            TimelineView(.periodic(from: .now, by: 1)) { context in
+                                Text(relativeTime(from: group.info.lastActivity, to: context.date))
+                                    .font(.system(size: 11 * s))
+                                    .foregroundStyle(.tertiary)
+                            }
+
+                            if !group.events.isEmpty {
+                                Image(systemName: "chevron.right")
+                                    .font(.system(size: 10 * s, weight: .bold))
+                                    .foregroundStyle(.tertiary)
+                                    .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                            }
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                    }
+                    .buttonStyle(.plain)
+
+                    if floatingManager.terminalFocusEnabled && !group.info.tty.isEmpty {
+                        Button { focusTerminal(tty: group.info.tty) } label: {
+                            Image(systemName: "terminal.fill")
+                                .font(.system(size: 10 * s, weight: .bold))
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Focus terminal")
+                        .padding(.trailing, 6)
+                    }
+
+                    Button { monitor.dismissSession(group.id) } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 10 * s, weight: .bold))
+                            .foregroundStyle(.tertiary)
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.trailing, 10)
+                }
+
+                if floatingManager.anyEnrichmentToggleOn {
+                    FlowLayout(spacing: 6) {
+                        if floatingManager.showFolderEnabled && !group.info.cwd.isEmpty {
+                            HStack(spacing: 4) {
+                                Image(systemName: "folder")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Text(headTruncated(group.info.cwd, max: 28))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.primary.opacity(0.06))
+                            .cornerRadius(4)
+                            .help(group.info.cwd)
+                        }
+                        if floatingManager.showGitEnabled,
+                           let git = enrichmentService.gitInfoByCwd[group.info.cwd] {
+                            let bg: Color = {
+                                if git.isDetached { return Color.pastelGray.opacity(0.30) }
+                                if git.isDirty { return Color.pastelYellow.opacity(0.30) }
+                                return Color.pastelGreen.opacity(0.30)
+                            }()
+                            let display: String = {
+                                var text = middleTruncated(git.branch, max: 20)
+                                if !git.isDetached && git.isDirty { text += "*" }
+                                if !git.isDetached, git.defaultBranch != nil,
+                                   let a = git.ahead, a > 0 { text += "\u{2191}\(a)" }
+                                if !git.isDetached, git.defaultBranch != nil,
+                                   let b = git.behind, b > 0 { text += "\u{2193}\(b)" }
+                                return text
+                            }()
+                            HStack(spacing: 4) {
+                                Image(systemName: "arrow.triangle.branch")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Text(display)
+                                    .font(.caption)
+                                    .foregroundStyle(.primary)
+                            }
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(bg)
+                            .cornerRadius(4)
+                            .help(git.branch)
+                        }
+                        if floatingManager.showGitEnabled,
+                           let git = enrichmentService.gitInfoByCwd[group.info.cwd],
+                           !git.isDetached, !git.branch.isEmpty,
+                           let pr = enrichmentService.prInfoByCwdBranch[EnrichmentService.prKey(cwd: group.info.cwd, branch: git.branch)] {
+                            Button {
+                                NSWorkspace.shared.open(pr.url)
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "arrow.up.forward.app")
+                                        .font(.caption)
+                                        .foregroundStyle(.tint)
+                                    Text("#\(String(pr.number))")
+                                        .font(.caption)
+                                        .foregroundStyle(.tint)
+                                }
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color.primary.opacity(0.06))
+                                .cornerRadius(4)
+                            }
+                            .buttonStyle(.plain)
+                            .help("Open PR #\(String(pr.number)) in browser")
+                        }
+                        if floatingManager.showModeEnabled,
+                           let mode = enrichmentService.transcriptInfoBySid[group.info.id]?.permissionMode {
+                            Text(mode)
+                                .font(.caption)
+                                .foregroundStyle(.primary)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color.pastelBlue.opacity(0.30))
+                                .clipShape(Capsule())
+                        }
+                        if floatingManager.showModelEnabled,
+                           let model = enrichmentService.transcriptInfoBySid[group.info.id]?.model {
+                            Text(shortModel(model))
+                                .font(.caption)
+                                .foregroundStyle(.primary)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color.pastelPurple.opacity(0.30))
+                                .clipShape(Capsule())
                         }
                     }
                     .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
+                    .padding(.bottom, 4)
                 }
-                .buttonStyle(.plain)
-
-                if floatingManager.terminalFocusEnabled && !group.info.tty.isEmpty {
-                    Button { focusTerminal(tty: group.info.tty) } label: {
-                        Image(systemName: "terminal.fill")
-                            .font(.system(size: 10 * s, weight: .bold))
-                            .foregroundStyle(.secondary)
-                    }
-                    .buttonStyle(.plain)
-                    .help("Focus terminal")
-                    .padding(.trailing, 6)
-                }
-
-                Button { monitor.dismissSession(group.id) } label: {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 10 * s, weight: .bold))
-                        .foregroundStyle(.tertiary)
-                }
-                .buttonStyle(.plain)
-                .padding(.trailing, 10)
             }
 
             // Events
@@ -1584,14 +2412,22 @@ class NaviAppDelegate: NSObject, NSApplicationDelegate {
 struct NaviApp: App {
     @NSApplicationDelegateAdaptor(NaviAppDelegate.self) var appDelegate
     @StateObject private var monitor = EventMonitor()
-    @StateObject private var floatingManager = FloatingWindowManager()
+    @StateObject private var floatingManager: FloatingWindowManager
+    @StateObject private var enrichmentService: EnrichmentService
     private let menuBar = MenuBarManager()
+
+    init() {
+        let manager = FloatingWindowManager()
+        _floatingManager = StateObject(wrappedValue: manager)
+        _enrichmentService = StateObject(wrappedValue: EnrichmentService(floatingManager: manager))
+    }
 
     var body: some Scene {
         Window("Navi", id: "monitor") {
-            ContentView(monitor: monitor, floatingManager: floatingManager, isFloatingWindow: true)
+            ContentView(monitor: monitor, floatingManager: floatingManager, enrichmentService: enrichmentService, isFloatingWindow: true)
                 .onAppear {
-                    menuBar.attach(monitor: monitor, floatingManager: floatingManager)
+                    monitor.attach(enrichmentService: enrichmentService)
+                    menuBar.attach(monitor: monitor, floatingManager: floatingManager, enrichmentService: enrichmentService)
                     if floatingManager.menuBarEnabled { menuBar.enable() }
                 }
                 .onReceive(floatingManager.$menuBarEnabled) { on in
