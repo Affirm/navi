@@ -152,7 +152,7 @@ If the feature requires new hook types, add them to `hooks/hooks.json`. Note tha
 
 ### 5. Key principles
 
-- **All features default to ON** for new installs (`UserDefaults.object == nil` check)
+- **Default ON unless the feature is purely cosmetic and adds visible noise.** Behavior-changing experimental features (auto-dismiss, instant notify, session status, permission details) default to ON for new installs (`UserDefaults.object == nil` → `set(true, ...)`); the goal is for users to discover and try the feature without hunting in Settings. Purely cosmetic UI additions that *layer extra visual elements onto existing UI* (e.g. session-row badges) MAY default OFF — but the nil-check pattern still applies so the default is recorded explicitly and can be flipped in a future release without a migration. When choosing OFF, note the rationale in the toggle's `didSet` or near its initialization. The four `NaviExp.Show*` toggles (folder/git/mode/model badges) are the canonical example.
 - **Flag files are the source of truth for hooks** — hooks never read UserDefaults
 - **Swift toggles take effect immediately** where possible — the `didSet` writes the flag file and SwiftUI reactivity handles UI changes
 - **Hooks always remain registered in `hooks.json`** — gating is done at runtime via flag files, not by modifying `hooks.json`. This avoids requiring Claude session restarts when toggling.
