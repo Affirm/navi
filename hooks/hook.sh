@@ -7,6 +7,10 @@ APP_BINARY="$APP/Contents/MacOS/Navi"
 EVENTS_DIR="/tmp/navi/events"
 RESPONSES_DIR="/tmp/navi/responses"
 mkdir -p "$EVENTS_DIR" "$RESPONSES_DIR"
+# Owner-only: event files hold Confidential tool input; response files are the
+# permission-decision channel that hook.sh trusts unconditionally. Chmod on
+# every fire so drift from earlier installs self-heals.
+chmod 700 /tmp/navi "$EVENTS_DIR" "$RESPONSES_DIR" 2>/dev/null || true
 
 # Clean up stale event/response files older than 5 minutes
 find "$EVENTS_DIR" "$RESPONSES_DIR" -type f -mmin +5 -delete 2>/dev/null || true
