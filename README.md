@@ -159,7 +159,9 @@ After any of these, run `bash build.sh` again.
 
 ## Contributors
 
-Navi started inside Affirm's internal plugin catalog before it became this standalone repo, so not all contributors appear in this repo's git history. Thanks to:
+Created by [@Clast](https://github.com/Clast)
+
+Navi started inside Affirm's internal plugin catalog before it became this standalone repo, so some contributors don't appear in this repo's git history. Special thanks to:
 
 - [@KieranLitschel](https://github.com/KieranLitschel) — improved session status (Working / Idle), session names, auto-dismiss, jump-to-terminal button
 
