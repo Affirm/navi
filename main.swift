@@ -57,15 +57,23 @@ private func relativeTime(from date: Date, to now: Date) -> String {
 
 // MARK: - Terminal Focus
 
-/// Run a shell command (via /bin/sh -c with a PATH that includes common Homebrew
-/// locations) and return stdout trimmed, or nil on failure / empty output.
-private func runShell(_ script: String) -> String? {
+/// Run tmux with the given args directly via Process(), bypassing /bin/sh so
+/// session names and other tmux arguments cannot be interpreted as shell
+/// metacharacters. Returns trimmed stdout, or nil on failure / empty output.
+///
+/// Resolution order: `NAVI_TMUX_PATH` env var (escape hatch for MacPorts,
+/// Nix, or custom Homebrew prefixes), then the standard install locations.
+private func runTmux(_ args: [String]) -> String? {
+    var candidatePaths = ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"]
+    if let override = ProcessInfo.processInfo.environment["NAVI_TMUX_PATH"], !override.isEmpty {
+        candidatePaths.insert(override, at: 0)
+    }
+    guard let path = candidatePaths.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
+        return nil
+    }
     let proc = Process()
-    proc.executableURL = URL(fileURLWithPath: "/bin/sh")
-    proc.arguments = ["-c", script]
-    var env = ProcessInfo.processInfo.environment
-    env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
-    proc.environment = env
+    proc.executableURL = URL(fileURLWithPath: path)
+    proc.arguments = args
     let pipe = Pipe()
     proc.standardOutput = pipe
     proc.standardError = FileHandle.nullDevice
@@ -89,7 +97,7 @@ private func runShell(_ script: String) -> String? {
 /// even if X is currently attached to a different session. Returns nil when
 /// tmux isn't installed, the TTY isn't a pane, or no client is attached at all.
 private func tmuxTargetForPane(_ paneTTY: String) -> (target: String, clientTTY: String)? {
-    guard let panes = runShell("tmux list-panes -a -F '#{pane_tty}|#{session_name}|#{window_index}.#{pane_index}' 2>/dev/null") else {
+    guard let panes = runTmux(["list-panes", "-a", "-F", "#{pane_tty}|#{session_name}|#{window_index}.#{pane_index}"]) else {
         return nil
     }
     var session: String?
@@ -102,13 +110,12 @@ private func tmuxTargetForPane(_ paneTTY: String) -> (target: String, clientTTY:
         break
     }
     guard let session = session, let target = target else { return nil }
-    let escapedSession = session.replacingOccurrences(of: "'", with: "'\\''")
-    if let attached = runShell("tmux list-clients -t '\(escapedSession)' -F '#{client_tty}' 2>/dev/null"),
+    if let attached = runTmux(["list-clients", "-t", session, "-F", "#{client_tty}"]),
        let clientTTY = attached.split(separator: "\n").first.map(String.init),
        !clientTTY.isEmpty {
         return (target, clientTTY)
     }
-    guard let anyClients = runShell("tmux list-clients -F '#{client_tty}' 2>/dev/null"),
+    guard let anyClients = runTmux(["list-clients", "-F", "#{client_tty}"]),
           let clientTTY = anyClients.split(separator: "\n").first.map(String.init),
           !clientTTY.isEmpty
     else { return nil }
@@ -194,9 +201,7 @@ func focusTerminal(tty: String) {
 
     if let t = tmuxTargetForPane(tty) {
         naviLog("focusTerminal: tmux pane → %@ via client %@", t.target, t.clientTTY)
-        let escTarget = t.target.replacingOccurrences(of: "'", with: "'\\''")
-        let escClient = t.clientTTY.replacingOccurrences(of: "'", with: "'\\''")
-        _ = runShell("tmux switch-client -c '\(escClient)' -t '\(escTarget)' 2>/dev/null")
+        _ = runTmux(["switch-client", "-c", t.clientTTY, "-t", t.target])
         activateTerminalApp(tty: t.clientTTY)
         return
     }
@@ -206,7 +211,7 @@ func focusTerminal(tty: String) {
 
 // MARK: - Version
 
-let naviCurrentVersion = "1.1.7"
+let naviCurrentVersion = "1.1.8"
 
 // MARK: - Pastel Palette
 
@@ -327,6 +332,10 @@ struct NaviEvent: Identifiable {
     let type: String      // permission, stop, notification
     let title: String
     let body: String
+    // AI-generated summary of the request. Untrusted: comes from the model,
+    // not from Claude Code's tool dispatcher. Rendered with a visual treatment
+    // distinct from `body` so it cannot impersonate authoritative tool args.
+    let description: String
     let sessionID: String
     let sessionName: String
     let pid: pid_t
@@ -510,6 +519,7 @@ class EventMonitor: ObservableObject {
                 type: dict["type"] as? String ?? "notification",
                 title: dict["title"] as? String ?? "Claude Code",
                 body: dict["body"] as? String ?? "",
+                description: dict["description"] as? String ?? "",
                 sessionID: dict["session_id"] as? String ?? "",
                 sessionName: dict["session_name"] as? String ?? "",
                 pid: pid_t(dict["pid"] as? Int ?? 0),
@@ -1932,7 +1942,7 @@ struct ContentView: View {
                 .font(.system(size: 9))
                 .foregroundStyle(.tertiary)
                 .padding(.top, 4)
-            Text("Thanks for using Navi!\nFeedback and feature suggestions are welcome!")
+            Text("Thanks for using Navi! #ask-navi\nFeedback and feature suggestions are welcome!")
                 .font(.system(size: 9))
                 .foregroundStyle(.tertiary)
                 .multilineTextAlignment(.center)
@@ -2467,11 +2477,22 @@ struct EventRow: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(event.title)
                         .font(.system(size: 13 * s, weight: .semibold))
+                    // Authoritative tool args: monospaced, primary visual weight.
                     Text(event.body)
                         .font(.system(size: 12 * s, design: .monospaced))
                         .foregroundStyle(.secondary)
                         .lineLimit(4)
                         .textSelection(.enabled)
+                    // AI-generated summary (untrusted): italic, prefixed label,
+                    // sans-serif. Distinct from the monospaced body above so a
+                    // crafted description string cannot pose as a real command.
+                    if !event.description.isEmpty {
+                        (Text("AI summary: ").italic().foregroundStyle(.tertiary)
+                            + Text(event.description).italic().foregroundStyle(.secondary))
+                            .font(.system(size: 11 * s))
+                            .lineLimit(2)
+                            .textSelection(.enabled)
+                    }
                 }
                 // Anchor the popover to this always-rendered VStack. Attaching
                 // it to the Show-details button causes SwiftUI to re-anchor
@@ -2480,11 +2501,21 @@ struct EventRow: View {
                 // produced a visible drop/offset during the transition.
                 .popover(isPresented: $showingDetails, arrowEdge: .leading) {
                     ScrollView {
-                        Text(event.body)
-                            .font(.system(size: 12 * s, design: .monospaced))
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(12)
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text(event.body)
+                                .font(.system(size: 12 * s, design: .monospaced))
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            if !event.description.isEmpty {
+                                Divider()
+                                (Text("AI summary: ").italic().foregroundStyle(.tertiary)
+                                    + Text(event.description).italic().foregroundStyle(.secondary))
+                                    .font(.system(size: 11 * s))
+                                    .textSelection(.enabled)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                        .padding(12)
                     }
                     .frame(width: 500, height: 400)
                 }
