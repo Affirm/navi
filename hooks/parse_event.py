@@ -76,16 +76,14 @@ def _render(value, level=0):
     return json.dumps(value, ensure_ascii=False)
 
 
+# Keep the AI-generated description separated from authoritative tool args
+# so a malicious file content cannot impersonate the actual command in the
+# UI. parts[] holds only fields that come straight from the tool_input
+# (tool name, command, file path, prompt, extras); description is emitted as
+# a sibling field that the UI renders with a distinct visual treatment.
 parts = []
 if tool:
     parts.append("Tool: " + tool)
-
-# Show the human-readable description whenever it's present. Claude Code
-# uses this as the summary line under the command, so surfacing it in Navi
-# gives the user the same at-a-glance context.
-desc = ti.get("description", "")
-if desc:
-    parts.append("Description: " + desc)
 
 cmd = ti.get("command", "")
 if cmd:
@@ -100,7 +98,8 @@ if prompt and not cmd and not fp:
     parts.append(prompt)
 
 # Permissions: append any remaining tool_input fields in readable form so the
-# user sees the full request in the detail popover.
+# user sees the full request in the detail popover. description is intentionally
+# excluded — it is surfaced separately, not interleaved with authoritative args.
 if is_permission:
     shown = {"command", "file_path", "prompt", "description"}
     extras = {k: v for k, v in ti.items() if k not in shown}
@@ -108,6 +107,12 @@ if is_permission:
         parts.append(_render(extras))
 
 body = "\n".join(parts)
+# Guard against non-string description values: a malformed tool_input could
+# carry a dict/list here, which would serialize fine into the JSON event but
+# Swift would silently drop on `as? String` decode. Forcing string-or-empty
+# keeps the contract explicit.
+_desc = ti.get("description", "")
+description = _desc if isinstance(_desc, str) else ""
 session_id = d.get("session_id", "")
 tool_use_id = d.get("tool_use_id", "")
 
@@ -176,6 +181,7 @@ elif event_name in TYPE_MAP:
         "type": etype,
         "title": title,
         "body": body,
+        "description": description,
         "session_id": session_id,
         "session_name": session_name,
         "pid": pid,

@@ -24,6 +24,26 @@ trap 'status=$?
         echo "See README -> Troubleshooting." >&2
       fi' EXIT
 
+# Pin SHA-256 of main.swift so a malicious edit cannot slip through review
+# unnoticed. Any legitimate change to main.swift must update
+# EXPECTED_MAIN_SWIFT_SHA256 in the same commit, surfacing the edit to PR
+# reviewers as a build.sh diff alongside the source change.
+EXPECTED_MAIN_SWIFT_SHA256="4f2e78a2dacaf280b4ab3018e306424c9072018a034771de00139cc96263eeb4"
+ACTUAL_MAIN_SWIFT_SHA256=$(shasum -a 256 "$DIR/main.swift" | cut -d' ' -f1)
+if [ "$ACTUAL_MAIN_SWIFT_SHA256" != "$EXPECTED_MAIN_SWIFT_SHA256" ]; then
+    cat >&2 <<EOF
+Navi build aborted: main.swift checksum mismatch.
+
+Expected SHA-256: $EXPECTED_MAIN_SWIFT_SHA256
+Actual SHA-256:   $ACTUAL_MAIN_SWIFT_SHA256
+
+If you intentionally edited main.swift, update build.sh with:
+    EXPECTED_MAIN_SWIFT_SHA256="$ACTUAL_MAIN_SWIFT_SHA256"
+and commit that change in the same PR.
+EOF
+    exit 1
+fi
+
 echo "Building Navi..." >&2
 echo "== Build environment ==" >&2
 echo "macOS:     $(sw_vers -productVersion) ($(uname -m))" >&2
