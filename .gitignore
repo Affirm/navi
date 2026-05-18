@@ -1,2 +1,4 @@
 Navi.app/
 .DS_Store
+.build/
+.swiftpm/

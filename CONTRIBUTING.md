@@ -15,7 +15,11 @@ bash build.sh        # Compiles main.swift into Navi.app
 open Navi.app        # Launch
 ```
 
-Navi is a single-file SwiftUI app (`main.swift`) compiled with `swiftc`. Requires macOS + Xcode Command Line Tools (`xcode-select --install`). No other dependencies.
+Navi is a SwiftUI app built with Swift Package Manager. Requires macOS + Xcode Command Line Tools (`xcode-select --install`). The test target depends on the standalone [`swift-testing`](https://github.com/swiftlang/swift-testing) package; runtime app code has no third-party dependencies.
+
+`bash build.sh` verifies per-file SHA-256 checksums for every `Sources/**/*.swift` file (see `EXPECTED_SOURCE_CHECKSUMS` in `build.sh`), runs `swift build -c release`, and assembles the `Navi.app` bundle around the resulting binary. The pin carries forward the intent of v1.1.8's `main.swift` SHA pin into the SPM layout: any source edit must update its checksum in `build.sh` in the same commit, surfacing the change to PR reviewers. A count check rejects sneaked-in `.swift` files that aren't in the table.
+
+Run unit tests with `swift test`. Tests live in `Tests/NaviCoreTests/` and exercise the `NaviCore` library target. SwiftUI views and the app shell (the `Navi` executable target) are not directly unit-tested; put testable logic in `NaviCore`.
 
 ## Architecture
 
@@ -23,13 +27,26 @@ Navi is a single-file SwiftUI app (`main.swift`) compiled with `swiftc`. Require
 
 | Path | Purpose |
 |------|---------|
-| `main.swift` | Single-file SwiftUI app — all UI, event polling, session management |
+| `Package.swift` | SPM manifest: `NaviCore` library, `Navi` executable, `NaviCoreTests` test target |
+| `Sources/NaviCore/` | Library: models (`NaviEvent`, `SessionInfo`, `SessionGroup`, `SessionStatus`, `GitInfo`, `TranscriptInfo`, `PRInfo`), `EventMonitor`, `FeatureFlags`, helpers (`relativeTime`, `focusTerminal`, `naviLog`), `naviCurrentVersion`, `SessionEnrichmentProvider` protocol |
+| `Sources/Navi/` | Executable: `@main` + `NaviAppDelegate`, `FloatingWindowManager`, `MenuBarManager`, `EnrichmentService` (conforms to `SessionEnrichmentProvider`), pastel palette, SwiftUI views (`ContentView`, `SessionSection`, `EventRow`, `WindowAccessor`, `FlowLayout`) |
+| `Tests/NaviCoreTests/` | Swift Testing suites for `NaviCore` |
 | `hooks/hooks.json` | Registers Claude Code hooks (loaded at session start) |
 | `hooks/hook.sh` | Main hook entrypoint for PermissionRequest, Stop, StopFailure, Notification, PostToolUse, PostToolUseFailure |
 | `hooks/pretooluse.sh` | Lightweight PreToolUse hook — captures `tool_use_id` for auto-dismiss |
 | `hooks/userpromptsubmit.sh` | Lightweight UserPromptSubmit hook — signals "Working" status |
 | `hooks/parse_event.py` | Parses hook payload JSON, writes event/resolve files to `/tmp/navi/events/` |
-| `build.sh` | Compiles `main.swift` into `Navi.app` bundle |
+| `build.sh` | Verifies per-file source checksums, runs `swift build -c release`, assembles `Navi.app` |
+
+### EnrichmentService boundary
+
+`EnrichmentService` lives in the `Navi` target because it depends on
+`FloatingWindowManager` (toggle state). `EventMonitor` lives in `NaviCore`
+and needs to call into the service on session updates / evictions, so
+`NaviCore` defines a `SessionEnrichmentProvider` protocol that
+`EnrichmentService` conforms to. Add new methods to the protocol if
+`EventMonitor` needs to talk to the service in new ways; views in `Navi`
+read concrete service state (`gitInfoByCwd`, etc.) directly.
 
 ### Event Flow
 
@@ -44,13 +61,13 @@ See the diagram in the [README](README.md#how-it-works) for the full set of hook
 
 Experimental features use file-based flags at `/tmp/navi/features/<name>`. This lets hooks skip work for disabled features without modifying `hooks.json` or restarting Claude Code sessions.
 
-- **Swift side:** `FloatingWindowManager.setFeatureFlag(_:enabled:)` creates/deletes flag files. Each toggle's `didSet` calls this, and `syncFeatureFlags()` writes all flags on startup.
+- **Swift side:** `FeatureFlags.set(_:enabled:)` (in `NaviCore`) creates/deletes flag files. Each `FloatingWindowManager` toggle's `didSet` calls it, and `syncFeatureFlags()` writes all flags on startup.
 - **Hook side:** scripts check `[ -f /tmp/navi/features/<name> ]` before doing feature-specific work. If the file is absent, the work is skipped.
 
 Two types of flag files:
 
-- **Boolean** (empty file): created by `setFeatureFlag(_:enabled:)`. File exists = enabled, absent = disabled.
-- **Configurable** (JSON content): created by `setFeatureConfig(_:config:)`. File exists = enabled, contents carry configuration. Hooks read config with `feature_config()` (Python) or `feature_config` (shell).
+- **Boolean** (empty file): created by `FeatureFlags.set(_:enabled:)`. File exists = enabled, absent = disabled.
+- **Configurable** (JSON content): created by `FeatureFlags.setConfig(_:config:)`. File exists = enabled, contents carry configuration. Hooks read config with `feature_config()` (Python) or `feature_config` (shell).
 
 Hooks should always check file existence first (is the feature enabled?) and only read config when needed. An empty file means "enabled with defaults."
 
@@ -60,15 +77,15 @@ Hooks should always check file existence first (is the feature enabled?) and onl
 
 Pick a kebab-case name (e.g., `my-feature`). This is used in `/tmp/navi/features/` and as the feature's identity across all layers.
 
-### 2. Swift changes (`main.swift`)
+### 2. Swift changes
 
-In `FloatingWindowManager`:
+In `Sources/Navi/FloatingWindowManager.swift`:
 
 ```swift
 @Published var myFeatureEnabled: Bool {
     didSet {
         UserDefaults.standard.set(myFeatureEnabled, forKey: "NaviExp.MyFeature")
-        Self.setFeatureFlag("my-feature", enabled: myFeatureEnabled)
+        FeatureFlags.set("my-feature", enabled: myFeatureEnabled)
     }
 }
 ```
@@ -87,10 +104,10 @@ if UserDefaults.standard.object(forKey: "NaviExp.MyFeature") == nil {
 In `syncFeatureFlags()`, add:
 
 ```swift
-Self.setFeatureFlag("my-feature", enabled: myFeatureEnabled)
+FeatureFlags.set("my-feature", enabled: myFeatureEnabled)
 ```
 
-In the `experimentalTab` section of `ContentView`, add the toggle:
+In the `experimentalTab` section of `Sources/Navi/Views/ContentView.swift`, add the toggle:
 
 ```swift
 experimentalRow("My Feature", subtitle: "Short description of what it does",
@@ -123,12 +140,12 @@ if feature_enabled("my-feature"):
 
 If the feature has settings beyond on/off (e.g., a timeout, a list of values):
 
-**Swift side** — use `setFeatureConfig` instead of `setFeatureFlag` in the `didSet`:
+**Swift side** — use `FeatureFlags.setConfig` instead of `FeatureFlags.set` in the `didSet`:
 ```swift
 @Published var myTimeout: Double = 120 {
     didSet {
         UserDefaults.standard.set(myTimeout, forKey: "NaviExp.MyFeature.Timeout")
-        Self.setFeatureConfig("my-feature", config: ["timeout": myTimeout])
+        FeatureFlags.setConfig("my-feature", config: ["timeout": myTimeout])
     }
 }
 ```
@@ -191,5 +208,5 @@ Rename `myFeatureEnabled` to drop any "experimental" connotation if present. Upd
 
 - Open an issue first for larger changes so we can discuss scope before you invest time.
 - Keep PRs focused — one feature or fix per PR.
-- Test your change locally (build with `bash build.sh`, exercise the feature across at least one full Claude Code session).
+- Test your change locally (build with `bash build.sh`, run `swift test`, exercise the feature across at least one full Claude Code session).
 - Update `CONTRIBUTING.md` if you change architecture or add a pattern worth documenting.
