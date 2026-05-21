@@ -3,12 +3,8 @@ import Foundation
 import Darwin
 @testable import NaviCore
 
-/// `displayName` reads `UserDefaults.standard` global state, so these tests
-/// must not run in parallel with each other.
-@Suite("SessionInfo", .serialized)
+@Suite("SessionInfo")
 struct SessionInfoTests {
-    private static let sessionNamesKey = "NaviExp.SessionNames"
-
     private func makeInfo(
         sessionName: String = "",
         projectName: String = "my-project",
@@ -25,46 +21,24 @@ struct SessionInfoTests {
         )
     }
 
-    /// Save the existing default, run the body with `value`, then restore.
-    private func withSessionNamesFlag(_ value: Bool, _ body: () -> Void) {
-        let original = UserDefaults.standard.object(forKey: Self.sessionNamesKey)
-        defer {
-            if let original = original {
-                UserDefaults.standard.set(original, forKey: Self.sessionNamesKey)
-            } else {
-                UserDefaults.standard.removeObject(forKey: Self.sessionNamesKey)
-            }
-        }
-        UserDefaults.standard.set(value, forKey: Self.sessionNamesKey)
-        body()
-    }
-
     @Test func displayNameFallsBackToProjectWhenFlagOff() {
-        withSessionNamesFlag(false) {
-            let info = makeInfo(sessionName: "Custom Name", projectName: "navi")
-            #expect(info.displayName == "navi")
-        }
+        let info = makeInfo(sessionName: "Custom Name", projectName: "navi")
+        #expect(info.displayName(useSessionName: false) == "navi")
     }
 
     @Test func displayNameFallsBackToProjectWhenSessionNameEmpty() {
-        withSessionNamesFlag(true) {
-            let info = makeInfo(sessionName: "", projectName: "navi")
-            #expect(info.displayName == "navi")
-        }
+        let info = makeInfo(sessionName: "", projectName: "navi")
+        #expect(info.displayName(useSessionName: true) == "navi")
     }
 
     @Test func displayNameUsesSessionNameWhenFlagOnAndNameSet() {
-        withSessionNamesFlag(true) {
-            let info = makeInfo(sessionName: "Custom Name", projectName: "navi")
-            #expect(info.displayName == "Custom Name")
-        }
+        let info = makeInfo(sessionName: "Custom Name", projectName: "navi")
+        #expect(info.displayName(useSessionName: true) == "Custom Name")
     }
 
     @Test func displayNameFallsBackToProjectWhenFlagOffEvenWithName() {
-        withSessionNamesFlag(false) {
-            let info = makeInfo(sessionName: "X", projectName: "Y")
-            #expect(info.displayName == "Y")
-        }
+        let info = makeInfo(sessionName: "X", projectName: "Y")
+        #expect(info.displayName(useSessionName: false) == "Y")
     }
 
     @Test func isAliveIsFalseForZeroPid() {

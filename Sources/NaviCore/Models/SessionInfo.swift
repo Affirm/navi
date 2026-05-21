@@ -33,9 +33,11 @@ public struct SessionInfo: Identifiable {
         self.lastActivity = lastActivity
     }
 
-    /// Display label: session name (if enabled and set), otherwise project folder name
-    public var displayName: String {
-        if UserDefaults.standard.bool(forKey: "NaviExp.SessionNames"), !sessionName.isEmpty {
+    /// Display label: session name (if `useSessionName` and set), otherwise project folder name.
+    /// `useSessionName` is supplied by the caller rather than read from UserDefaults so
+    /// SessionInfo stays a pure value type with no global-state dependency.
+    public func displayName(useSessionName: Bool) -> String {
+        if useSessionName, !sessionName.isEmpty {
             return sessionName
         }
         return projectName
