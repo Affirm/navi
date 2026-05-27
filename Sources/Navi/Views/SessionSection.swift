@@ -48,7 +48,7 @@ struct SessionSection: View {
                             Image(systemName: "folder.fill")
                                 .foregroundStyle(.secondary)
                                 .font(.system(size: 11 * s))
-                            Text(group.info.displayName)
+                            Text(group.info.displayName(useSessionName: floatingManager.sessionNamesEnabled))
                                 .font(.system(size: 13 * s, weight: .semibold))
 
                             Text(group.info.shortSession)

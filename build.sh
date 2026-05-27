@@ -44,7 +44,7 @@ Sources/Navi/PastelPalette.swift                  27327a7bca05a1d5683df81ea993ac
 Sources/Navi/Views/ContentView.swift              3ed2c01c56ae36765957e2a61a97c59864432c7217b7661c799eebb704779c74
 Sources/Navi/Views/EventRow.swift                 3a7890296fa2586ee6de82d67220a39bac2ba41fdc6856d698ea78a445c703ad
 Sources/Navi/Views/FlowLayout.swift               58848e9059bdc13d77d803fda4d96f80dfe9ab6fca40b13ec46b8bec9738c9ad
-Sources/Navi/Views/SessionSection.swift           86506b10167555d587dedf2372e69f00029cbf631891e8a101a87833dc96c11d
+Sources/Navi/Views/SessionSection.swift           b894e126b90aa0e0e3d91bce3e4af315972c8712395b3988faaf4acdf4bd8401
 Sources/Navi/Views/WindowAccessor.swift           2e3a59384cd4f21985d97ab34805db3ae988650d9a007b395d7a7efd303ab630
 Sources/NaviCore/EventMonitor.swift               9527624c89c3e23312a99272d58de70fe0da5a9a8d4d09f58183cd7ae22c1a81
 Sources/NaviCore/FeatureFlags.swift               e9d8c847c2f04ea128caab971b75a49cda59e41cc323017619cc84e29e690228
@@ -54,7 +54,7 @@ Sources/NaviCore/Models/GitInfo.swift             b5a95e8be176b17cb67c5726923d9a
 Sources/NaviCore/Models/NaviEvent.swift           e48aa05310d0f57a56363e908400af1d78acbce5969e2cdfc6b65004690c7534
 Sources/NaviCore/Models/PRInfo.swift              0d5f2f8384508b182eb4ca827ecac51004094a8484b384b117f6a3d2ba329d49
 Sources/NaviCore/Models/SessionGroup.swift        a34f92fd4a2ded929ad16fedbd9d3c7f29df7cc4e2c80c1440bbe7355f2df8ea
-Sources/NaviCore/Models/SessionInfo.swift         af431a54d3fd81791fb5cf8c046d9dd49b51cb53992dee310bf993734328be2e
+Sources/NaviCore/Models/SessionInfo.swift         5775e9a713dc6eaba9a951689ad131cc5b6265e1a18edf48c3a8012ab036a66f
 Sources/NaviCore/Models/SessionStatus.swift       c0a90ed97250e23e362a61397b7525fee1b0646330de805528dc2c77e53d1d63
 Sources/NaviCore/Models/TranscriptInfo.swift      cf5a3e4c07123156dc31187ac1a62e4eed4126f0ba85fb32bd0daab051d4ffcb
 Sources/NaviCore/SessionEnrichmentProvider.swift  b18d9987764d8d4206a765b7a54cc12cd808a562228989d0b68db990149f4ea7
