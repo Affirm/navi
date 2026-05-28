@@ -15,7 +15,8 @@ chmod 700 /tmp/navi "$EVENTS_DIR" "$RESPONSES_DIR" 2>/dev/null || true
 # Clean up stale event/response files older than 5 minutes
 find "$EVENTS_DIR" "$RESPONSES_DIR" -type f -mmin +5 -delete 2>/dev/null || true
 
-# Build if needed (build.sh compares plugin.json version to built-version marker)
+# Install if needed (build.sh fetches the release for plugin.json's version
+# and short-circuits when Navi.app's built-version marker already matches)
 bash "$PLUGIN_ROOT/build.sh" >&2
 
 # Launch the monitor app if not running (skip if NAVI_NO_AUTO_LAUNCH is set).

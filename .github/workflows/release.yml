@@ -1,0 +1,160 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write       # gh release create, tag creation
+  id-token: write       # attest-build-provenance OIDC
+  attestations: write   # attest-build-provenance
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check-version:
+    name: check version
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      should_release: ${{ steps.check.outputs.should_release }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - name: Checkout
+        # actions/checkout v6.0.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+          fetch-depth: 0   # need tags to detect existing releases
+
+      - name: Decide whether to release
+        id: check
+        run: |
+          set -euo pipefail
+          VERSION=$(sed -n 's/.*"version".*"\([^"]*\)".*/\1/p' .claude-plugin/plugin.json)
+          TAG="v$VERSION"
+          if git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
+            echo "Tag $TAG already exists; no release needed."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Tag $TAG does not exist; will release $TAG."
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: build (${{ matrix.run }})
+    needs: check-version
+    if: needs.check-version.outputs.should_release == 'true'
+    runs-on: macos-15
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        run: [primary, verify]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - name: Build artifact
+        run: bash scripts/build-from-source.sh "$RUNNER_TEMP/out"
+
+      - name: Compute checksums
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/out"
+          shasum -a 256 Navi.app.zip > checksums.txt
+          cat checksums.txt
+
+      - name: Upload artifact
+        # actions/upload-artifact v4.4.3
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882
+        with:
+          name: navi-build-${{ matrix.run }}
+          path: |
+            ${{ runner.temp }}/out/Navi.app.zip
+            ${{ runner.temp }}/out/checksums.txt
+          if-no-files-found: error
+
+  verify:
+    name: verify reproducibility
+    needs: [check-version, build]
+    if: needs.check-version.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Download primary build
+        # actions/download-artifact v4.1.8
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
+        with:
+          name: navi-build-primary
+          path: primary
+
+      - name: Download verify build
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
+        with:
+          name: navi-build-verify
+          path: verify
+
+      - name: Compare SHA-256s
+        run: |
+          set -euo pipefail
+          PRIMARY=$(awk '{print $1}' primary/checksums.txt)
+          VERIFY=$(awk '{print $1}' verify/checksums.txt)
+          echo "primary: $PRIMARY"
+          echo "verify:  $VERIFY"
+          if [ "$PRIMARY" != "$VERIFY" ]; then
+            echo "::error::Reproducibility regression: two independent macos-15 builds produced different SHA-256s. Refusing to publish."
+            exit 1
+          fi
+          echo "Two-build reproducibility check passed."
+
+  publish:
+    name: publish release
+    needs: [check-version, build, verify]
+    if: needs.check-version.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - name: Download primary build
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
+        with:
+          name: navi-build-primary
+          path: release
+
+      - name: Attest build provenance
+        # actions/attest-build-provenance v4.1.0
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32
+        with:
+          subject-path: release/Navi.app.zip
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.check-version.outputs.version }}"
+          TAG="v$VERSION"
+          SHA256=$(awk '{print $1}' release/checksums.txt)
+          gh release create "$TAG" \
+            --target "$GITHUB_SHA" \
+            --title "Navi $TAG" \
+            --notes "Automated release built and verified by .github/workflows/release.yml.
+
+          SHA-256: \`$SHA256\`
+
+          Build provenance is attested via GitHub's Sigstore integration; verify locally with:
+
+              gh attestation verify Navi.app.zip --owner ${GITHUB_REPOSITORY_OWNER}
+
+          The plugin's hook-time \`build.sh\` script does this automatically when the \`gh\` CLI is installed." \
+            release/Navi.app.zip release/checksums.txt

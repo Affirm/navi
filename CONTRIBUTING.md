@@ -11,13 +11,23 @@ This project adheres to the [Open Code of Conduct](https://github.com/spotify/co
 ```bash
 git clone https://github.com/Affirm/navi.git
 cd navi
-bash build.sh        # Compiles main.swift into Navi.app
+bash build.sh        # Downloads + verifies the published Navi.app release
 open Navi.app        # Launch
 ```
 
 Navi is a SwiftUI app built with Swift Package Manager. Requires macOS + Xcode Command Line Tools (`xcode-select --install`). The test target depends on the standalone [`swift-testing`](https://github.com/swiftlang/swift-testing) package; runtime app code has no third-party dependencies.
 
-`bash build.sh` verifies per-file SHA-256 checksums for every `Sources/**/*.swift` file (see `EXPECTED_SOURCE_CHECKSUMS` in `build.sh`), runs `swift build -c release`, and assembles the `Navi.app` bundle around the resulting binary. The pin carries forward the intent of v1.1.8's `main.swift` SHA pin into the SPM layout: any source edit must update its checksum in `build.sh` in the same commit, surfacing the change to PR reviewers. A count check rejects sneaked-in `.swift` files that aren't in the table.
+`bash build.sh` is the hook-time install entrypoint: it reads the target version from `.claude-plugin/plugin.json`, fetches `Navi.app.zip` from the matching GitHub Release, verifies it against the release's `checksums.txt`, and (if the `gh` CLI is installed) also verifies the build-provenance attestation against the Sigstore transparency log. **It does not compile from source.** Releases are produced exclusively by `.github/workflows/release.yml`, which builds the same artifact twice on separate `macos-15` runners and refuses to publish if the two builds' SHA-256s diverge — that two-build check is what catches reproducibility regressions before they reach users.
+
+To compile locally instead of fetching (e.g., when validating source changes before publishing a release), use either:
+
+```bash
+bash scripts/build-from-source.sh ./out   # produces ./out/Navi.app and ./out/Navi.app.zip
+# or, to install in place:
+NAVI_BUILD_FROM_SOURCE=1 bash build.sh
+```
+
+`scripts/build-from-source.sh` is what CI's release workflow runs, so a successful local build is a strong signal that the eventual release will succeed.
 
 Run unit tests with `swift test`. Tests live in `Tests/NaviCoreTests/` and exercise the `NaviCore` library target. SwiftUI views and the app shell (the `Navi` executable target) are not directly unit-tested; put testable logic in `NaviCore`.
 
@@ -36,7 +46,9 @@ Run unit tests with `swift test`. Tests live in `Tests/NaviCoreTests/` and exerc
 | `hooks/pretooluse.sh` | Lightweight PreToolUse hook — captures `tool_use_id` for auto-dismiss |
 | `hooks/userpromptsubmit.sh` | Lightweight UserPromptSubmit hook — signals "Working" status |
 | `hooks/parse_event.py` | Parses hook payload JSON, writes event/resolve files to `/tmp/navi/events/` |
-| `build.sh` | Verifies per-file source checksums, runs `swift build -c release`, assembles `Navi.app` |
+| `build.sh` | Hook-time install entrypoint: fetches the published release for the version in `plugin.json`, verifies checksums.txt + Sigstore attestation, extracts `Navi.app` |
+| `scripts/build-from-source.sh` | Reproducible-build recipe used by CI and by contributors building locally |
+| `.github/workflows/release.yml` | Builds two artifacts on `macos-15`, compares SHA-256s, attests provenance, publishes the release |
 
 ### EnrichmentService boundary
 
@@ -208,5 +220,5 @@ Rename `myFeatureEnabled` to drop any "experimental" connotation if present. Upd
 
 - Open an issue first for larger changes so we can discuss scope before you invest time.
 - Keep PRs focused — one feature or fix per PR.
-- Test your change locally (build with `bash build.sh`, run `swift test`, exercise the feature across at least one full Claude Code session).
+- Test your change locally (build with `NAVI_BUILD_FROM_SOURCE=1 bash build.sh` to install your in-progress changes in place, run `swift test`, exercise the feature across at least one full Claude Code session).
 - Update `CONTRIBUTING.md` if you change architecture or add a pattern worth documenting.
