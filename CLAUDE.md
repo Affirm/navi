@@ -10,9 +10,9 @@ This file contains instructions for Claude Code agents. For human contributor gu
 
 When the user asks to "set up Navi", "install Navi", or similar:
 
-**Before running any commands, tell the user what you're about to do** (build the app and launch it — hooks are handled by the plugin system) **and use the AskUserQuestion tool with Yes/No options to confirm before proceeding.**
+**Before running any commands, tell the user what you're about to do** (download and verify the published Navi.app release, then launch it — hooks are handled by the plugin system) **and use the AskUserQuestion tool with Yes/No options to confirm before proceeding.**
 
-1. Build the app:
+1. Install the app (downloads and verifies the release artifact for the version in `plugin.json`):
    ```bash
    bash build.sh
    ```

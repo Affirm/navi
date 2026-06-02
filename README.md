@@ -54,7 +54,7 @@ If you'd rather not use the plugin system:
 ```bash
 git clone https://github.com/Affirm/navi.git
 cd navi
-bash build.sh
+bash build.sh        # Downloads + verifies the published Navi.app release
 open Navi.app
 ```
 
@@ -106,11 +106,11 @@ rm -rf /tmp/navi
 ```bash
 git clone https://github.com/Affirm/navi.git
 cd navi
-bash build.sh        # Compiles main.swift into Navi.app
-open Navi.app        # Launch
+bash scripts/build-from-source.sh ./out   # Compiles Sources/ into ./out/Navi.app(.zip)
+open ./out/Navi.app                       # Launch
 ```
 
-The app is a single-file SwiftUI app (`main.swift`) compiled with `swiftc`. No other dependencies. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the feature-flag system and guidance on adding experimental features.
+`bash build.sh` is the *install* entrypoint — it downloads the pre-built release artifact for the version in `plugin.json` and verifies its checksum + Sigstore attestation, but does not compile from source. Contributors compile via `scripts/build-from-source.sh` (or `NAVI_BUILD_FROM_SOURCE=1 bash build.sh` to install a local build in place). See [`CONTRIBUTING.md`](CONTRIBUTING.md) for architecture, the feature-flag system, and guidance on adding experimental features.
 
 ## Troubleshooting
 
@@ -133,7 +133,7 @@ xcrun --show-sdk-version
 xcrun --show-sdk-path
 ```
 
-`build.sh` prints the same information at the top of every build, so you can read it from the build output too.
+`scripts/build-from-source.sh` prints the same information at the top of every build, so you can read it from the build output too.
 
 **Fix in order of escalation:**
 
@@ -156,7 +156,7 @@ xcrun --show-sdk-path
 
 3. **Update macOS + Xcode/CLT to current.** If the versions have drifted far apart across major releases, install all pending updates in System Settings → General → Software Update, then reinstall CLT.
 
-After any of these, run `bash build.sh` again.
+After any of these, run `bash scripts/build-from-source.sh ./out` (or `bash build.sh` if you only meant to install the published release) again.
 
 ## Contributors
 

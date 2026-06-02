@@ -1,1 +1,1 @@
-public let naviCurrentVersion = "1.1.8"
+public let naviCurrentVersion = "1.1.9"
