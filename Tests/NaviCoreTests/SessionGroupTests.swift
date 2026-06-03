@@ -7,7 +7,10 @@ import Darwin
 struct SessionGroupTests {
     private func makeInfo(
         pid: pid_t = 0,
-        lastEventType: String = ""
+        lastEventType: String = "",
+        lastActivity: Date = Date(),
+        claudeStatus: String = "",
+        statusUpdatedAt: Date? = nil
     ) -> SessionInfo {
         var info = SessionInfo(
             id: "sid",
@@ -16,7 +19,10 @@ struct SessionGroupTests {
             cwd: "/tmp/navi",
             tty: "",
             sessionName: "",
-            pid: pid
+            pid: pid,
+            lastActivity: lastActivity,
+            claudeStatus: claudeStatus,
+            statusUpdatedAt: statusUpdatedAt
         )
         info.lastEventType = lastEventType
         return info
@@ -107,5 +113,65 @@ struct SessionGroupTests {
         let group = SessionGroup(id: "sid", info: makeInfo(pid: 0, lastEventType: "working"), events: [])
         // Dead process — lastEventType is ignored
         #expect(group.status == .idle)
+    }
+
+    // MARK: - canonical status reconcile
+
+    @Test func canonicalIdleNewerThanHookHealsStuckWorking() {
+        // Missed Stop hook: hook still says "working", but the canonical file
+        // updated more recently to "idle" — canonical wins.
+        let hookAt = Date()
+        let info = makeInfo(
+            pid: getpid(), lastEventType: "working", lastActivity: hookAt,
+            claudeStatus: "idle", statusUpdatedAt: hookAt.addingTimeInterval(5))
+        #expect(SessionGroup(id: "sid", info: info, events: []).status == .waitingForInput)
+    }
+
+    @Test func canonicalBusyNewerThanHookHealsStuckIdle() {
+        // Missed UserPromptSubmit hook: hook says "stop", canonical says "busy"
+        // and is newer — canonical wins.
+        let hookAt = Date()
+        let info = makeInfo(
+            pid: getpid(), lastEventType: "stop", lastActivity: hookAt,
+            claudeStatus: "busy", statusUpdatedAt: hookAt.addingTimeInterval(5))
+        #expect(SessionGroup(id: "sid", info: info, events: []).status == .working)
+    }
+
+    @Test func freshHookWinsOverOlderCanonical() {
+        // A just-fired hook (newer than the canonical write) keeps Navi instant.
+        let canonicalAt = Date()
+        let info = makeInfo(
+            pid: getpid(), lastEventType: "working", lastActivity: canonicalAt.addingTimeInterval(5),
+            claudeStatus: "idle", statusUpdatedAt: canonicalAt)
+        #expect(SessionGroup(id: "sid", info: info, events: []).status == .working)
+    }
+
+    @Test func missingCanonicalTimestampFallsBackToHook() {
+        // Canonical status present but no updatedAt — can't reconcile, use hook.
+        let info = makeInfo(
+            pid: getpid(), lastEventType: "working",
+            claudeStatus: "idle", statusUpdatedAt: nil)
+        #expect(SessionGroup(id: "sid", info: info, events: []).status == .working)
+    }
+
+    @Test func canonicalWaitingIsDeferredToHookPath() {
+        // "waiting" is intentionally not reconciled here (remote-approval
+        // handling lands with the tmux work) — the hook view stands.
+        let hookAt = Date()
+        let info = makeInfo(
+            pid: getpid(), lastEventType: "working", lastActivity: hookAt,
+            claudeStatus: "waiting", statusUpdatedAt: hookAt.addingTimeInterval(5))
+        #expect(SessionGroup(id: "sid", info: info, events: []).status == .working)
+    }
+
+    @Test func pendingPermissionWinsOverCanonicalStatus() {
+        let hookAt = Date()
+        let info = makeInfo(
+            pid: getpid(), lastEventType: "working", lastActivity: hookAt,
+            claudeStatus: "busy", statusUpdatedAt: hookAt.addingTimeInterval(5))
+        let group = SessionGroup(id: "sid", info: info, events: [
+            makeEvent(type: "permission", resolved: false),
+        ])
+        #expect(group.status == .needsAttention)
     }
 }

@@ -81,8 +81,8 @@ struct SessionSection: View {
                     }
                     .buttonStyle(.plain)
 
-                    if !group.info.tty.isEmpty {
-                        Button { focusTerminal(tty: group.info.tty) } label: {
+                    if !group.info.tty.isEmpty || group.info.pid > 0 {
+                        Button { focusTerminal(tty: group.info.tty, pid: group.info.pid) } label: {
                             Image(systemName: "terminal.fill")
                                 .font(.system(size: 10 * s, weight: .bold))
                                 .foregroundStyle(.secondary)

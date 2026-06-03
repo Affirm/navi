@@ -219,9 +219,22 @@ public class EventMonitor: ObservableObject {
         }
     }
 
-    /// Scan ~/.claude/sessions/ for running Claude processes and add any
-    /// that Navi doesn't know about yet. Skips sessions already tracked
-    /// to avoid resetting their state (TTY, lastEventType, etc.).
+    /// Parse Claude's `updatedAt` field (epoch milliseconds) into a Date.
+    private func parseUpdatedAt(_ any: Any?) -> Date? {
+        let ms: Double?
+        if let d = any as? Double { ms = d }
+        else if let i = any as? Int { ms = Double(i) }
+        else { ms = nil }
+        guard let ms, ms > 0 else { return nil }
+        return Date(timeIntervalSince1970: ms / 1000)
+    }
+
+    /// Scan ~/.claude/sessions/ for running Claude processes. Adds any session
+    /// Navi doesn't know about yet, and — for sessions already tracked —
+    /// refreshes the canonical `status`/`updatedAt` fields each poll so the
+    /// reconcile in SessionGroup.status can self-heal stale hook-derived state.
+    /// Other per-session state (TTY, lastEventType) is preserved for tracked
+    /// sessions; the expensive TTY lookup runs only on first discovery.
     private func discoverSessions() {
         let sessionsDir = NSString(string: "~/.claude/sessions").expandingTildeInPath
         let fm = FileManager.default
@@ -230,11 +243,21 @@ public class EventMonitor: ObservableObject {
             let path = "\(sessionsDir)/\(file)"
             guard let data = fm.contents(atPath: path),
                   let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let sid = dict["sessionId"] as? String,
-                  sessions[sid] == nil,       // skip already-tracked sessions
-                  let pid = dict["pid"] as? Int,
-                  kill(pid_t(pid), 0) == 0    // only alive processes
+                  let sid = dict["sessionId"] as? String
             else { continue }
+
+            let claudeStatus = dict["status"] as? String ?? ""
+            let statusUpdatedAt = parseUpdatedAt(dict["updatedAt"])
+
+            // Already tracked: just refresh the canonical status fields.
+            if sessions[sid] != nil {
+                sessions[sid]!.claudeStatus = claudeStatus
+                sessions[sid]!.statusUpdatedAt = statusUpdatedAt
+                continue
+            }
+
+            // New session: require a live process before adding it.
+            guard let pid = dict["pid"] as? Int, kill(pid_t(pid), 0) == 0 else { continue }
             let cwd = dict["cwd"] as? String ?? ""
             let name = dict["name"] as? String ?? ""
             // Look up TTY from the process so terminal focus works immediately
@@ -261,7 +284,9 @@ public class EventMonitor: ObservableObject {
                 tty: tty,
                 sessionName: name,
                 pid: pid_t(pid),
-                lastActivity: Date()
+                lastActivity: Date(),
+                claudeStatus: claudeStatus,
+                statusUpdatedAt: statusUpdatedAt
             )
             if let info = sessions[sid] {
                 enrichmentService?.refresh(for: info)

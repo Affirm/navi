@@ -10,6 +10,14 @@ public struct SessionInfo: Identifiable {
     public var pid: pid_t
     public var lastEventType: String = ""
     public var lastActivity: Date = Date()
+    /// Canonical status from `~/.claude/sessions/<pid>.json` ("busy" | "idle" |
+    /// "waiting" | ""). Read directly from the file Claude maintains, so it
+    /// stays correct even when a hook is missed. Empty when unavailable.
+    public var claudeStatus: String = ""
+    /// `updatedAt` from the same file, i.e. when Claude last wrote that status.
+    /// Used to reconcile the canonical status against hook-derived state by
+    /// trusting whichever signal is newer. Nil when unavailable.
+    public var statusUpdatedAt: Date? = nil
 
     public init(
         id: String,
@@ -20,7 +28,9 @@ public struct SessionInfo: Identifiable {
         sessionName: String,
         pid: pid_t,
         lastEventType: String = "",
-        lastActivity: Date = Date()
+        lastActivity: Date = Date(),
+        claudeStatus: String = "",
+        statusUpdatedAt: Date? = nil
     ) {
         self.id = id
         self.projectName = projectName
@@ -31,6 +41,8 @@ public struct SessionInfo: Identifiable {
         self.pid = pid
         self.lastEventType = lastEventType
         self.lastActivity = lastActivity
+        self.claudeStatus = claudeStatus
+        self.statusUpdatedAt = statusUpdatedAt
     }
 
     /// Display label: session name (if `useSessionName` and set), otherwise project folder name.
