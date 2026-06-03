@@ -47,10 +47,15 @@ echo "Swift:     $(xcrun -sdk macosx swift --version 2>&1 | head -1)" >&2
 echo "SDK:       $(xcrun -sdk macosx --show-sdk-version 2>/dev/null) at $(xcrun -sdk macosx --show-sdk-path 2>/dev/null)" >&2
 echo "=======================" >&2
 
-# -Xlinker -no_uuid: zero out Mach-O LC_UUID so two builds of identical
-# inputs produce identical binaries (ld64 otherwise injects a random UUID).
+# -Xlinker -reproducible: make two builds of identical inputs produce identical
+# binaries (CI's verify job depends on this). ld-prime keeps a valid LC_UUID
+# derived from a content hash, so the output stays bit-identical while remaining
+# debuggable. We deliberately avoid -no_uuid: ld(1) warns that UUID-less binaries
+# break the debugger and crash-reporting/symbolication tools, and a UUID-less
+# x86_64 build won't load under Rosetta 2 (which keys its translation cache on
+# the UUID). Requires the new linker (ld-prime, Xcode 15+); errors on older ld.
 ( cd "$DIR" && xcrun -sdk macosx swift build -c release \
-    -Xlinker -no_uuid \
+    -Xlinker -reproducible \
     --product Navi \
     --build-path "$OUT/.build" )
 
