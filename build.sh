@@ -88,30 +88,62 @@ EOF
     exit 1
 fi
 
-# Cryptographic verification when gh is available: confirms the artifact
-# was built by this repo's CI from a real commit, not just that bits
-# match a checksum that an attacker may have published alongside.
-if command -v gh >/dev/null 2>&1; then
+# Cryptographic verification confirms the artifact was built by this repo's CI
+# from a real commit, not just that its bits match a checksum an attacker may
+# have published alongside. It needs the gh CLI and an authenticated token.
+#
+# We distinguish "couldn't COMPLETE verification" from "verification ran and
+# FAILED", because only the latter is a tamper signal:
+#   - gh missing / not logged in        -> SHA-256 integrity check only (warn)
+#   - attestation verifies              -> strong guarantee, proceed
+#   - can't complete (auth / network / Sigstore outage)
+#                                       -> SHA-256 fallback (warn): the artifact
+#                                          may be fine, we just can't reach or
+#                                          authorize the verifier
+#   - completes and fails (no attestation / bad signature)
+#                                       -> ABORT: SHA-256 can't save us here, since
+#                                          a swapped artifact can ship a matching
+#                                          checksums.txt. Unknown errors also abort
+#                                          (fail closed).
+if ! command -v gh >/dev/null 2>&1; then
+    echo "Verified: SHA-256 matches checksums.txt. (For stronger attestation-based verification, install the gh CLI and run 'gh auth login': https://cli.github.com/)" >&2
+elif ! gh auth status >/dev/null 2>&1; then
+    echo "Verified: SHA-256 matches checksums.txt. (For stronger attestation-based verification, run 'gh auth login'.)" >&2
+else
     OWNER="${REPO_SLUG%/*}"
-    if gh attestation verify "$TMP/$ZIP_NAME" --owner "$OWNER" >/dev/null 2>&1; then
+    if ATT_OUT=$(gh attestation verify "$TMP/$ZIP_NAME" --owner "$OWNER" 2>&1); then
         echo "Verified: SHA-256 matches checksums.txt; build provenance attestation OK (gh attestation verify --owner $OWNER)." >&2
+    elif printf '%s' "$ATT_OUT" | grep -qiE 'HTTP (401|403)|bad credentials|unauthorized|forbidden|timed? ?out|i/o timeout|connection (refused|reset)|could not resolve|dial tcp|network is unreachable|TLS'; then
+        cat >&2 <<EOF
+
+Navi: skipping build-provenance attestation — the attestation API could not be
+reached or the request was not authorized (an auth or network issue, not a
+problem with the downloaded file). Falling back to the SHA-256 checksum match,
+which already passed.
+
+gh reported:
+$ATT_OUT
+
+Manual check:
+  gh attestation verify "$TMP/$ZIP_NAME" --owner "$OWNER"
+EOF
     else
         cat >&2 <<EOF
 
-Navi install aborted: attestation verification failed.
+Navi install aborted: build-provenance attestation verification FAILED.
 
-The artifact's SHA matched checksums.txt, but the GitHub attestation
-chain could not be verified. This may indicate a compromised release
-or a transient Sigstore outage. Re-run with:
+The SHA-256 matched checksums.txt, but the artifact's attestation could not be
+verified — this can indicate a tampered release. SHA-256 alone can't protect you
+here: an attacker who swaps the artifact can also swap checksums.txt.
 
+gh reported:
+$ATT_OUT
+
+Investigate before retrying. Manual check:
   gh attestation verify "$TMP/$ZIP_NAME" --owner "$OWNER"
-
-for full output, and investigate before retrying.
 EOF
         exit 1
     fi
-else
-    echo "Verified: SHA-256 matches checksums.txt. (Install the gh CLI for stronger attestation-based verification: https://cli.github.com/)" >&2
 fi
 
 # Extract into place.
