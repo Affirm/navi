@@ -136,6 +136,25 @@ struct ContentView: View {
             .popover(isPresented: $showSettings, arrowEdge: .bottom) {
                 settingsPopover
             }
+            // Pop the floating window back out without diving into Settings.
+            // Shown from the menu-bar popover (not the window itself): reopens
+            // the window when it's closed, and otherwise brings it to the front
+            // when it's open but buried behind other windows.
+            if !isFloatingWindow {
+                Button {
+                    if !floatingManager.isFloating {
+                        floatingManager.isFloating = true   // reopen (didSet orders it front)
+                    }
+                    NaviWindow.ref?.makeKeyAndOrderFront(nil)
+                    NSApp.activate(ignoringOtherApps: true)
+                } label: {
+                    Image(systemName: "macwindow.on.rectangle")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Show floating window / bring to front")
+            }
             Spacer()
             if !sessionGroups.isEmpty {
                 Text("\(sessionGroups.count) session\(sessionGroups.count == 1 ? "" : "s")")
