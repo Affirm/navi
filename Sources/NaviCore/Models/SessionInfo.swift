@@ -55,8 +55,23 @@ public struct SessionInfo: Identifiable {
         return projectName
     }
 
-    /// Check if the Claude Code process is still running
+    /// Check if the Claude Code process is still running.
+    ///
+    /// This only asks whether *some* process holds `pid` — it cannot tell
+    /// whether that process is still the Claude session that created it. After
+    /// PID reuse (or a resumed session whose original PID exited) this can
+    /// report a dead session as alive, so it must not be used for pruning.
+    /// Use `isAlive(among:)` when an authoritative live-session set is available.
     public var isAlive: Bool {
         pid > 0 && kill(pid, 0) == 0
+    }
+
+    /// Identity-verified liveness: true only when this session's own id is
+    /// backed by a currently-running Claude process. `liveSessionIDs` is the set
+    /// of session IDs read from `~/.claude/sessions/` for live PIDs. Because the
+    /// session's *id* (not just its PID) must appear in the set, a reused or
+    /// drifted PID can no longer keep a dead session alive.
+    public func isAlive(among liveSessionIDs: Set<String>) -> Bool {
+        liveSessionIDs.contains(id)
     }
 }

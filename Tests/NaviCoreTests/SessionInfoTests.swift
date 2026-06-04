@@ -58,4 +58,19 @@ struct SessionInfoTests {
         // use. kill(pid, 0) returns -1 with errno=ESRCH for such PIDs.
         #expect(!makeInfo(pid: 999_999).isAlive)
     }
+
+    @Test func isAliveAmongIsTrueWhenIdInLiveSet() {
+        // makeInfo uses id "session-id". A live process holds it regardless of PID.
+        #expect(makeInfo(pid: 0).isAlive(among: ["session-id"]))
+    }
+
+    @Test func isAliveAmongIsFalseWhenIdMissing() {
+        // Ghost case: the PID may still resolve to *some* process (here a live
+        // one), but identity verification rejects it because the id is absent.
+        #expect(!makeInfo(pid: getpid()).isAlive(among: ["other-session"]))
+    }
+
+    @Test func isAliveAmongIsFalseForEmptyLiveSet() {
+        #expect(!makeInfo(pid: getpid()).isAlive(among: []))
+    }
 }
