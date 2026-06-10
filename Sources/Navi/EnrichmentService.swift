@@ -18,6 +18,9 @@ final class EnrichmentService: ObservableObject, SessionEnrichmentProvider {
     @Published private(set) var gitInfoByCwd: [String: GitInfo] = [:]
     @Published private(set) var transcriptInfoBySid: [String: TranscriptInfo] = [:]
     @Published private(set) var prInfoByCwdBranch: [String: PRInfo] = [:]
+    /// Sub-agents (Agent/Task tool invocations) per parent session id, derived
+    /// from `<project>/<sessionId>/subagents/agent-*.meta.json` on disk.
+    @Published private(set) var subagentsBySid: [String: [SubagentInfo]] = [:]
 
     private let queue = DispatchQueue(label: "navi.enrichment", qos: .utility)
     private var gitCache: [String: GitInfo] = [:]
@@ -31,6 +34,11 @@ final class EnrichmentService: ObservableObject, SessionEnrichmentProvider {
     private var pendingTranscriptRefreshes: Set<String> = []
     private var inFlightTranscriptRefreshes: Set<String> = []
     private var lastTranscriptRefreshBySid: [String: Date] = [:]
+
+    private var subagentsCache: [String: [SubagentInfo]] = [:]
+    private var pendingSubagentRefreshes: Set<String> = []
+    private var inFlightSubagentRefreshes: Set<String> = []
+    private var lastSubagentRefreshBySid: [String: Date] = [:]
 
     private var prCache: [String: PRInfo] = [:]
     private var pendingPRRefreshes: Set<String> = []
@@ -63,6 +71,9 @@ final class EnrichmentService: ObservableObject, SessionEnrichmentProvider {
         if floatingManager.showModeEnabled || floatingManager.showModelEnabled,
            !session.id.isEmpty {
             scheduleTranscriptRefresh(sessionID: session.id, cwd: cwd)
+        }
+        if floatingManager.showSubagentsEnabled, !session.id.isEmpty {
+            scheduleSubagentsRefresh(sessionID: session.id, cwd: cwd)
         }
     }
 
@@ -352,6 +363,14 @@ final class EnrichmentService: ObservableObject, SessionEnrichmentProvider {
                     self?.transcriptInfoBySid.removeValue(forKey: sessionID)
                 }
             }
+            let droppedSubagents = self.subagentsCache.removeValue(forKey: sessionID) != nil
+            self.pendingSubagentRefreshes.remove(sessionID)
+            self.lastSubagentRefreshBySid.removeValue(forKey: sessionID)
+            if droppedSubagents {
+                DispatchQueue.main.async { [weak self] in
+                    self?.subagentsBySid.removeValue(forKey: sessionID)
+                }
+            }
         }
     }
 
@@ -494,6 +513,153 @@ final class EnrichmentService: ObservableObject, SessionEnrichmentProvider {
         transcriptCache[sessionID] = newInfo
         DispatchQueue.main.async { [weak self] in
             self?.transcriptInfoBySid[sessionID] = newInfo
+        }
+    }
+
+    private func scheduleSubagentsRefresh(sessionID: String, cwd: String) {
+        queue.async { [weak self] in
+            guard let self = self else { return }
+            if self.pendingSubagentRefreshes.contains(sessionID) ||
+               self.inFlightSubagentRefreshes.contains(sessionID) {
+                return
+            }
+            // Unlike git/transcript, there's no cache-TTL early-return here: sub-agent
+            // state changes at hook-event frequency, so each event triggers a fresh
+            // scan. The 0.5 s debounce only coalesces bursts of near-simultaneous
+            // events; the in-flight guard serializes the rest so they never pile up.
+            if let last = self.lastSubagentRefreshBySid[sessionID],
+               Date().timeIntervalSince(last) < 0.5 {
+                self.pendingSubagentRefreshes.insert(sessionID)
+                let delay = 0.5 - Date().timeIntervalSince(last)
+                self.queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+                    guard let self = self else { return }
+                    self.pendingSubagentRefreshes.remove(sessionID)
+                    self.runSubagentsRefresh(sessionID: sessionID, cwd: cwd)
+                }
+                return
+            }
+            self.runSubagentsRefresh(sessionID: sessionID, cwd: cwd)
+        }
+    }
+
+    private func runSubagentsRefresh(sessionID: String, cwd: String) {
+        if inFlightSubagentRefreshes.contains(sessionID) { return }
+        inFlightSubagentRefreshes.insert(sessionID)
+        lastSubagentRefreshBySid[sessionID] = Date()
+        defer { inFlightSubagentRefreshes.remove(sessionID) }
+
+        // The subagents dir is a sibling of the transcript:
+        // <project>/<sessionId>/subagents/. Reuse transcriptURL so we inherit
+        // its direct-then-scan project-encoding fallback.
+        let fm = FileManager.default
+        guard let transcript = transcriptURL(forSessionID: sessionID, cwd: cwd) else {
+            clearSubagents(sessionID: sessionID)
+            return
+        }
+        let subagentsDir = transcript
+            .deletingPathExtension()
+            .appendingPathComponent("subagents", isDirectory: true)
+
+        guard let entries = try? fm.contentsOfDirectory(atPath: subagentsDir.path) else {
+            clearSubagents(sessionID: sessionID)
+            return
+        }
+
+        // Completed sub-agents have a matching tool_result in the parent
+        // transcript; running ones do not. Collect the completed set once.
+        let completed = completedToolUseIDs(transcriptURL: transcript)
+        let now = Date()
+
+        var infos: [SubagentInfo] = []
+        for entry in entries where entry.hasPrefix("agent-") && entry.hasSuffix(".meta.json") {
+            let agentID = String(entry.dropFirst("agent-".count).dropLast(".meta.json".count))
+            guard !agentID.isEmpty else { continue }
+            let metaURL = subagentsDir.appendingPathComponent(entry, isDirectory: false)
+            guard let data = fm.contents(atPath: metaURL.path),
+                  let meta = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else { continue }
+
+            let agentType = meta["agentType"] as? String ?? ""
+            let description = meta["description"] as? String ?? ""
+            let toolUseID = meta["toolUseId"] as? String ?? ""
+
+            // Timestamps come from the transcript .jsonl file attributes — cheap,
+            // no parse. creationDate = startedAt, modificationDate = lastActivity.
+            // Fall back to the meta file (which we just read, so it exists) if the
+            // .jsonl hasn't been created yet — using a fresh Date() here would make
+            // the value unstable across refreshes and defeat the `existing == infos`
+            // dedup, republishing every hook event until the .jsonl appears.
+            let jsonlURL = subagentsDir.appendingPathComponent("agent-\(agentID).jsonl", isDirectory: false)
+            let attrs = (try? fm.attributesOfItem(atPath: jsonlURL.path))
+                ?? (try? fm.attributesOfItem(atPath: metaURL.path))
+            let startedAt = (attrs?[.creationDate] as? Date) ?? (attrs?[.modificationDate] as? Date) ?? .distantPast
+            let lastActivity = (attrs?[.modificationDate] as? Date) ?? startedAt
+
+            // Running = the parent has no tool_result for this Agent call yet.
+            // The mtime backstop means that on the next refresh a long-idle
+            // sub-agent stops showing "running" even if its tool_result ever falls
+            // outside the scanned window (e.g. a background agent in a very busy
+            // session). Note: isRunning is only recomputed when a hook event drives
+            // a refresh, not by the view's 1 s timer, so the flip happens on the
+            // next event for the session rather than exactly at 60 s.
+            let isRunning = !toolUseID.isEmpty
+                && !completed.contains(toolUseID)
+                && now.timeIntervalSince(lastActivity) < 60
+            infos.append(SubagentInfo(
+                id: agentID,
+                agentType: agentType,
+                description: description,
+                toolUseId: toolUseID,
+                startedAt: startedAt,
+                lastActivity: lastActivity,
+                isRunning: isRunning
+            ))
+        }
+
+        infos.sort { $0.startedAt < $1.startedAt }
+
+        let existing = subagentsCache[sessionID] ?? []
+        if existing == infos {
+            if infos.isEmpty { subagentsCache.removeValue(forKey: sessionID) }
+            return
+        }
+        if infos.isEmpty {
+            clearSubagents(sessionID: sessionID)
+            return
+        }
+        subagentsCache[sessionID] = infos
+        DispatchQueue.main.async { [weak self] in
+            self?.subagentsBySid[sessionID] = infos
+        }
+    }
+
+    /// Scan the parent transcript for tool_result blocks and return the set of
+    /// tool_use_ids they resolve. A sub-agent whose spawning Agent tool_use id is
+    /// in this set has finished. Reads a generous 2 MB tail: the default 64 KB is
+    /// far too small here — a finished sub-agent's tool_result gets buried under
+    /// subsequent parent activity, leaving it stuck looking "running". 2 MB
+    /// covers far more recent turns than any sub-agent inside the display window
+    /// could be pushed out by, while staying bounded on multi-MB transcripts.
+    private func completedToolUseIDs(transcriptURL: URL) -> Set<String> {
+        guard let lines = readTranscriptTail(url: transcriptURL, maxBytes: 2_000_000) else { return [] }
+        var completed = Set<String>()
+        for line in lines {
+            guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+                  let message = obj["message"] as? [String: Any],
+                  let content = message["content"] as? [[String: Any]]
+            else { continue }
+            for block in content where (block["type"] as? String) == "tool_result" {
+                if let id = block["tool_use_id"] as? String { completed.insert(id) }
+            }
+        }
+        return completed
+    }
+
+    private func clearSubagents(sessionID: String) {
+        if subagentsCache.removeValue(forKey: sessionID) != nil {
+            DispatchQueue.main.async { [weak self] in
+                self?.subagentsBySid.removeValue(forKey: sessionID)
+            }
         }
     }
 

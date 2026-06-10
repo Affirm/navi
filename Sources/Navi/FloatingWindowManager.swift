@@ -54,8 +54,12 @@ class FloatingWindowManager: ObservableObject {
         didSet { UserDefaults.standard.set(showModelEnabled, forKey: "NaviExp.ShowModel") }
     }
 
+    @Published var showSubagentsEnabled: Bool {
+        didSet { UserDefaults.standard.set(showSubagentsEnabled, forKey: "NaviExp.ShowSubagents") }
+    }
+
     var anyEnrichmentToggleOn: Bool {
-        showFolderEnabled || showGitEnabled || showModeEnabled || showModelEnabled
+        showFolderEnabled || showGitEnabled || showModeEnabled || showModelEnabled || showSubagentsEnabled
     }
 
     /// Width for the menu-bar popover. The floating window is user-resizable,
@@ -157,6 +161,12 @@ class FloatingWindowManager: ObservableObject {
             showModelEnabled = false
         } else {
             showModelEnabled = UserDefaults.standard.bool(forKey: "NaviExp.ShowModel")
+        }
+        if UserDefaults.standard.object(forKey: "NaviExp.ShowSubagents") == nil {
+            UserDefaults.standard.set(false, forKey: "NaviExp.ShowSubagents")
+            showSubagentsEnabled = false
+        } else {
+            showSubagentsEnabled = UserDefaults.standard.bool(forKey: "NaviExp.ShowSubagents")
         }
         // Clean up legacy feature flag files from removed options. Manual resize
         // became permanent in 1.1.x — no longer a toggle.

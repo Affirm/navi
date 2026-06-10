@@ -203,6 +203,11 @@ struct SessionSection: View {
                 }
             }
 
+            // Sub-agents (Task tool) nested under this session.
+            if floatingManager.showSubagentsEnabled {
+                subagentTree
+            }
+
             // Events
             if isExpanded && !group.events.isEmpty {
                 Divider().padding(.horizontal, 8)
@@ -231,5 +236,68 @@ struct SessionSection: View {
         .onChange(of: shouldExpand) { _, expand in
             withAnimation(.easeInOut(duration: 0.2)) { isExpanded = expand }
         }
+    }
+
+    // Running + recently-finished sub-agents, nested under the session as a
+    // tree. The TimelineView drives both the relative-time labels and the
+    // recently-finished drop-off (finished rows linger briefly, then age out)
+    // without depending on a new enrichment event to re-render.
+    @ViewBuilder private var subagentTree: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+            let subs = visibleSubagents(now: context.date)
+            if !subs.isEmpty {
+                VStack(spacing: 0) {
+                    ForEach(Array(subs.enumerated()), id: \.element.id) { idx, sub in
+                        subagentRow(sub, isLast: idx == subs.count - 1, now: context.date)
+                    }
+                }
+                .padding(.leading, 18)
+                .padding(.trailing, 10)
+                .padding(.bottom, 4)
+            }
+        }
+    }
+
+    private func visibleSubagents(now: Date) -> [SubagentInfo] {
+        let all = enrichmentService.subagentsBySid[group.info.id] ?? []
+        return all
+            .filter { $0.isRunning || now.timeIntervalSince($0.lastActivity) < 30 }
+            .sorted { a, b in
+                if a.isRunning != b.isRunning { return a.isRunning }
+                return a.startedAt < b.startedAt
+            }
+    }
+
+    private func subagentRow(_ sub: SubagentInfo, isLast: Bool, now: Date) -> some View {
+        HStack(spacing: 6) {
+            Text(isLast ? "\u{2514}\u{2500}" : "\u{251C}\u{2500}")
+                .font(.system(size: 11 * s, design: .monospaced))
+                .foregroundStyle(.tertiary)
+
+            Image(systemName: sub.isRunning ? "gearshape.circle.fill" : "checkmark.circle.fill")
+                .font(.system(size: 11 * s))
+                .foregroundStyle(sub.isRunning ? Color.green : Color.secondary)
+
+            Text(sub.agentType.isEmpty ? "agent" : sub.agentType)
+                .font(.system(size: 11 * s, weight: .medium, design: .monospaced))
+                .foregroundStyle(sub.isRunning ? .primary : .secondary)
+                .lineLimit(1)
+
+            if !sub.description.isEmpty {
+                Text(middleTruncated(sub.description, max: 32))
+                    .font(.system(size: 11 * s))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+
+            Spacer(minLength: 4)
+
+            Text(relativeTime(from: sub.lastActivity, to: now))
+                .font(.system(size: 10 * s))
+                .foregroundStyle(.tertiary)
+        }
+        .padding(.vertical, 2)
+        .opacity(sub.isRunning ? 1 : 0.55)
+        .help(sub.description.isEmpty ? sub.agentType : "\(sub.agentType): \(sub.description)")
     }
 }

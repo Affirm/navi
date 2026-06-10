@@ -135,3 +135,43 @@ struct EnrichmentServicePrKeyTests {
         #expect(expected == "/tmp/navi\u{1f}feat/x")
     }
 }
+
+@Suite("SubagentInfo Equatable")
+struct SubagentInfoEquatableTests {
+    private func make(
+        id: String = "a0503c80c233a372f",
+        agentType: String = "Explore",
+        description: String = "search the codebase",
+        toolUseId: String = "toolu_01abc",
+        startedAt: Date = Date(timeIntervalSince1970: 1_000),
+        lastActivity: Date = Date(timeIntervalSince1970: 1_005),
+        isRunning: Bool = true
+    ) -> SubagentInfo {
+        SubagentInfo(id: id, agentType: agentType, description: description,
+                     toolUseId: toolUseId, startedAt: startedAt,
+                     lastActivity: lastActivity, isRunning: isRunning)
+    }
+
+    @Test func identicalValuesAreEqual() {
+        // The enrichment publishes a new array only when `existing != infos`,
+        // so identical values must compare equal to avoid redundant UI churn.
+        #expect(make() == make())
+    }
+
+    @Test func runningTransitionIsNotEqual() {
+        // The running -> finished flip must be observed so the row updates.
+        #expect(make(isRunning: true) != make(isRunning: false))
+    }
+
+    @Test func newActivityIsNotEqual() {
+        // A fresh lastActivity must re-publish so relative-time / drop-off works.
+        #expect(make(lastActivity: Date(timeIntervalSince1970: 1_005))
+                != make(lastActivity: Date(timeIntervalSince1970: 1_099)))
+    }
+
+    @Test func differentAgentIdentityIsNotEqual() {
+        #expect(make(id: "x") != make(id: "y"))
+        #expect(make(agentType: "Explore") != make(agentType: "Plan"))
+        #expect(make(toolUseId: "toolu_a") != make(toolUseId: "toolu_b"))
+    }
+}

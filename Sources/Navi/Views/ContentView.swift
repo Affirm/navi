@@ -345,6 +345,9 @@ struct ContentView: View {
             experimentalRow("Claude model", subtitle: "Show the model used by each session (e.g. opus-4-7, sonnet-4-6).",
                 isOn: Binding(get: { floatingManager.showModelEnabled }, set: { floatingManager.showModelEnabled = $0 }))
 
+            experimentalRow("Sub-agents", subtitle: "Show sub-agents (Task tool) as a tree nested under the parent session that spawned them.",
+                isOn: Binding(get: { floatingManager.showSubagentsEnabled }, set: { floatingManager.showSubagentsEnabled = $0 }))
+
             Spacer()
         }
         .padding(12)
