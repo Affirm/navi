@@ -155,15 +155,19 @@ public class EventMonitor: ObservableObject {
                 // permissions for this session — the turn ended, so any
                 // unresolved permission was denied/interrupted. Other
                 // non-permission events use a 30s age threshold.
-                if event.type != "permission" {
+                // Info events are passive status cards — they don't affect pending permissions.
+                if event.type != "permission" && event.type != "info" {
                     let minAge: TimeInterval = event.type == "stop" ? 0 : 30
                     for i in self.events.indices where self.events[i].sessionID == event.sessionID && self.events[i].isPending && event.timestamp.timeIntervalSince(self.events[i].timestamp) > minAge {
                         self.events[i].resolved = true
                         self.events[i].response = "dismissed"
                     }
                 }
-                // Keep only the latest event per session (preserve pending permissions)
-                self.events.removeAll { $0.sessionID == event.sessionID && !$0.isPending }
+                // Keep only the latest event per session (preserve pending permissions).
+                // Info events are additive — they don't displace the current stop/notification card.
+                if event.type != "info" {
+                    self.events.removeAll { $0.sessionID == event.sessionID && !$0.isPending }
+                }
                 self.events.insert(event, at: 0)
             }
             newEventTypes.insert(event.type)
@@ -185,6 +189,7 @@ public class EventMonitor: ObservableObject {
         DispatchQueue.main.async {
             self.events.removeAll { event in
                 if event.isPending { return false }
+                if event.type == "info" && !event.resolved { return false }
                 if event.resolved { return now.timeIntervalSince(event.timestamp) > 10 }
                 return now.timeIntervalSince(event.timestamp) > 60
             }
@@ -326,6 +331,10 @@ public class EventMonitor: ObservableObject {
         guard !sid.isEmpty else { return }
 
         if sessions[sid] == nil {
+            // Don't create a phantom session entry for external info events —
+            // they may arrive after a session ends (e.g. a spend card from the
+            // private plugin's SessionEnd hook).
+            guard event.type != "info" else { return }
             sessions[sid] = SessionInfo(
                 id: sid,
                 projectName: event.projectName,
@@ -387,6 +396,18 @@ public class EventMonitor: ObservableObject {
             if let svc = self.enrichmentService {
                 svc.evict(sessionID: sessionID)
                 svc.evictUnused(activeCwds: Set(self.sessions.values.map(\.cwd)))
+            }
+        }
+    }
+
+    /// Inject an internally-generated alert event directly (bypasses the file
+    /// pipeline). Called by EnrichmentService when a context threshold is crossed.
+    public func receiveAlert(_ event: NaviEvent) {
+        DispatchQueue.main.async {
+            self.events.insert(event, at: 0)
+            if UserDefaults.standard.object(forKey: "NaviSound.info") as? Bool ?? false {
+                let name = UserDefaults.standard.string(forKey: "NaviSound.info.name") ?? "Glass"
+                NSSound(named: NSSound.Name(name))?.play()
             }
         }
     }

@@ -13,6 +13,7 @@ struct EventRow: View {
         case "permission":
             return event.resolved ? "checkmark.shield.fill" : "shield.lefthalf.filled"
         case "stop": return "checkmark.circle.fill"
+        case "info": return "info.circle.fill"
         default: return "bell.fill"
         }
     }
@@ -23,6 +24,7 @@ struct EventRow: View {
             if event.resolved { return event.response == "approve" ? .green : .red }
             return .orange
         case "stop": return .green
+        case "info": return .blue
         default: return .secondary
         }
     }
