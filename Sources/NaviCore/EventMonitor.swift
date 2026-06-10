@@ -178,7 +178,7 @@ public class EventMonitor: ObservableObject {
                 guard event.type != "stop" else { return }
                 self.events.insert(event, at: 0)
             }
-            newEventTypes.insert(event.type)
+            if event.type != "stop" { newEventTypes.insert(event.type) }
             try? fm.removeItem(atPath: path)
         }
 
@@ -228,7 +228,7 @@ public class EventMonitor: ObservableObject {
                 self.sessions = self.sessions.filter { $0.value.isAlive(among: liveSessionIDs) }
                 let pruned = before.subtracting(self.sessions.keys)
                 if !pruned.isEmpty {
-                    self.events.removeAll { $0.type == "info" && pruned.contains($0.sessionID) }
+                    self.events.removeAll { !$0.isPending && pruned.contains($0.sessionID) }
                     if let svc = self.enrichmentService {
                         pruned.forEach { svc.evict(sessionID: $0) }
                         svc.evictUnused(activeCwds: Set(self.sessions.values.map(\.cwd)))
