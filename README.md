@@ -32,7 +32,10 @@ Hooks are registered automatically. Navi builds and launches itself the first ti
 | **Menu bar icon** | Toggle the window; icon signals pending permissions |
 | **Per-event sounds** | Configurable alerts for permission, completion, notification events |
 | **Multi-session** | Monitor many concurrent Claude Code sessions side-by-side |
-| **Session row badges** | Optional per-session badges for working folder, git status, permission mode, model, and open PR (each independently toggleable in Settings, all default off) |
+| **Sub-agent tree** | Nested Task tool agents shown as a live tree under their parent session |
+| **Context size bar** | Mini colored progress bar on each session showing current input token usage |
+| **Context window alerts** | Sticky info card when a session crosses configurable warning/critical thresholds, recommending `/compact` |
+| **Session row badges** | Optional per-session badges for working folder, git branch/status, permission mode, model, context size, and open PR (each independently toggleable in Settings, all default off) |
 
 ## Requirements
 
@@ -43,9 +46,7 @@ Hooks are registered automatically. Navi builds and launches itself the first ti
 
 ## Settings
 
-Click the gear icon to configure sounds, font size, and experimental features (jump-to-terminal, menu bar icon, session status, instant notifications, etc.). Each feature is independently toggleable; most default on.
-
-Each sound can be set to any macOS system sound (Glass, Ping, Submarine, etc.).
+Click the gear icon to open settings. The **General** tab covers auto-launch, sounds (per-event, any macOS system sound), display (font scale), and stable features like the menu bar icon, session names, permission details, and session row badges. The **Experimental** tab holds newer features: sub-agents, context size bar, and context window alerts with configurable warning/critical thresholds.
 
 ## Manual Setup
 
@@ -65,7 +66,6 @@ Then register the hooks from `hooks/hooks.json` in your `~/.claude/settings.json
 ```
 Claude Code session
   │
-  ├── UserPromptSubmit ──→ userpromptsubmit.sh ──→ writes working signal ──→ /tmp/navi/events/
   ├── PreToolUse ────────→ pretooluse.sh ────────→ captures tool_use_id ──→ /tmp/navi/pretooluse/
   ├── PermissionRequest ─→ hook.sh → parse_event.py → event JSON ─────────→ /tmp/navi/events/
   ├── PostToolUse ───────→ hook.sh → parse_event.py → resolve signal ─────→ /tmp/navi/events/
@@ -75,11 +75,14 @@ Claude Code session
   └── PostToolUseFailure → hook.sh → parse_event.py → resolve signal ─────→ /tmp/navi/events/
 
 ~/.claude/sessions/*.json ──→ Navi session discovery (PID liveness + TTY lookup)
+External producers ────────→ drop info event JSON ────────────────────────→ /tmp/navi/events/
 
 Navi.app
   ├── polls /tmp/navi/events/ (instant via kqueue watcher + fallback timer)
   ├── discovers sessions from ~/.claude/sessions/
   ├── tracks Working/Idle/Dead status per session
+  ├── EnrichmentService polls transcripts → git status, model, mode, context tokens
+  │     └─ context window alert ──────────────────────────────────────────→ injected directly
   └── displays events in SwiftUI floating window + menu bar popover
         │
         User clicks Approve/Deny
@@ -92,6 +95,29 @@ Navi.app
 For permission requests, `hook.sh` writes an event file and polls for a response file. When you click Approve/Deny, Navi writes the response, the hook picks it up and returns the decision to Claude Code. If no response comes within 120 seconds, it falls back to the terminal prompt.
 
 For architecture details and guidance on extending Navi, see [`CONTRIBUTING.md`](CONTRIBUTING.md).
+
+## External Plugins
+
+Navi exposes a simple file-drop API: any process can write a JSON event to `/tmp/navi/events/` and it appears as a card in the floating window. This lets you surface custom monitoring, cost tracking, or workflow notifications without touching the Navi source or forking the repo.
+
+The `info` event type is the external interface — it produces non-interactive, sticky status cards (no approve/deny buttons, no permission semantics). Cards stay visible until the user dismisses them or your producer resolves them.
+
+```bash
+NAVI_EVENTS="/tmp/navi/events"
+if [ -d "$NAVI_EVENTS" ]; then
+  ID="$(date +%s)-$(openssl rand -hex 16)"
+  printf '{"id":"%s","timestamp":%s,"type":"info","title":"My Plugin","body":"Hello from my plugin","description":"","session_id":"%s","session_name":"","pid":0,"cwd":"","tty":"","tool_use_id":"","expires":0}\n' \
+    "$ID" "$(date +%s)" "${CLAUDE_SESSION_ID:-}" \
+    > "$NAVI_EVENTS/.${ID}.tmp" \
+  && mv "$NAVI_EVENTS/.${ID}.tmp" "$NAVI_EVENTS/${ID}.json"
+fi
+```
+
+The `[ -d "$NAVI_EVENTS" ]` guard makes the integration a no-op when Navi isn't installed.
+
+**Example use cases:** monthly API spend vs. budget, CI/CD status, custom tool-use summaries, team notifications.
+
+See [`docs/EXTENSION_API.md`](docs/EXTENSION_API.md) for the full schema, atomicity rules, and security constraints.
 
 ## Uninstall
 
