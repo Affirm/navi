@@ -58,9 +58,10 @@ struct TranscriptInfoEquatableTests {
     private func make(
         model: String? = "claude-opus-4-7",
         permissionMode: String? = "auto",
+        contextTokens: Int? = 42_000,
         fetchedAt: Date = Date(timeIntervalSince1970: 1_000)
     ) -> TranscriptInfo {
-        TranscriptInfo(model: model, permissionMode: permissionMode, fetchedAt: fetchedAt)
+        TranscriptInfo(model: model, permissionMode: permissionMode, contextTokens: contextTokens, fetchedAt: fetchedAt)
     }
 
     @Test func ignoresFetchedAt() {
@@ -79,9 +80,14 @@ struct TranscriptInfoEquatableTests {
         #expect(make(permissionMode: nil) != make(permissionMode: "auto"))
     }
 
+    @Test func differentContextTokensIsNotEqual() {
+        #expect(make(contextTokens: 100_000) != make(contextTokens: 200_000))
+        #expect(make(contextTokens: nil) != make(contextTokens: 100_000))
+    }
+
     @Test func bothNilIsEqual() {
-        let a = make(model: nil, permissionMode: nil)
-        let b = make(model: nil, permissionMode: nil, fetchedAt: Date(timeIntervalSince1970: 999_999))
+        let a = make(model: nil, permissionMode: nil, contextTokens: nil)
+        let b = make(model: nil, permissionMode: nil, contextTokens: nil, fetchedAt: Date(timeIntervalSince1970: 999_999))
         #expect(a == b)
     }
 }

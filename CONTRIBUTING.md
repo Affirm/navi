@@ -38,14 +38,14 @@ Run unit tests with `swift test`. Tests live in `Tests/NaviCoreTests/` and exerc
 | Path | Purpose |
 |------|---------|
 | `Package.swift` | SPM manifest: `NaviCore` library, `Navi` executable, `NaviCoreTests` test target |
-| `Sources/NaviCore/` | Library: models (`NaviEvent`, `SessionInfo`, `SessionGroup`, `SessionStatus`, `GitInfo`, `TranscriptInfo`, `PRInfo`), `EventMonitor`, `FeatureFlags`, helpers (`relativeTime`, `focusTerminal`, `naviLog`), `naviCurrentVersion`, `SessionEnrichmentProvider` protocol |
+| `Sources/NaviCore/` | Library: models (`NaviEvent`, `SessionInfo`, `SessionGroup`, `SessionStatus`, `GitInfo`, `TranscriptInfo`, `PRInfo`, `SubagentInfo`), `EventMonitor`, `FeatureFlags`, helpers (`relativeTime`, `focusTerminal`, `naviLog`), `naviCurrentVersion`, `SessionEnrichmentProvider` protocol |
 | `Sources/Navi/` | Executable: `@main` + `NaviAppDelegate`, `FloatingWindowManager`, `MenuBarManager`, `EnrichmentService` (conforms to `SessionEnrichmentProvider`), pastel palette, SwiftUI views (`ContentView`, `SessionSection`, `EventRow`, `WindowAccessor`, `FlowLayout`) |
 | `Tests/NaviCoreTests/` | Swift Testing suites for `NaviCore` |
 | `hooks/hooks.json` | Registers Claude Code hooks (loaded at session start) |
 | `hooks/hook.sh` | Main hook entrypoint for PermissionRequest, Stop, StopFailure, Notification, PostToolUse, PostToolUseFailure |
 | `hooks/pretooluse.sh` | Lightweight PreToolUse hook — captures `tool_use_id` for auto-dismiss |
-| `hooks/userpromptsubmit.sh` | Lightweight UserPromptSubmit hook — signals "Working" status |
 | `hooks/parse_event.py` | Parses hook payload JSON, writes event/resolve files to `/tmp/navi/events/` |
+| `docs/EXTENSION_API.md` | Public contract for external info-event producers — schema, atomicity rules, security constraints |
 | `build.sh` | Hook-time install entrypoint: fetches the published release for the version in `plugin.json`, verifies checksums.txt + Sigstore attestation, extracts `Navi.app` |
 | `scripts/build-from-source.sh` | Reproducible-build recipe used by CI and by contributors building locally |
 | `.github/workflows/release.yml` | Builds two artifacts on `macos-15`, compares SHA-256s, attests provenance, publishes the release |
@@ -119,10 +119,10 @@ In `syncFeatureFlags()`, add:
 FeatureFlags.set("my-feature", enabled: myFeatureEnabled)
 ```
 
-In the `experimentalTab` section of `Sources/Navi/Views/ContentView.swift`, add the toggle:
+In `Sources/Navi/Views/ContentView.swift`, add the toggle to `experimentalTab` (for new/unproven features) or `generalTab` (if it's ready to ship stable):
 
 ```swift
-experimentalRow("My Feature", subtitle: "Short description of what it does",
+settingsRow("My Feature", subtitle: "Short description of what it does",
     isOn: Binding(get: { floatingManager.myFeatureEnabled }, set: { floatingManager.myFeatureEnabled = $0 }))
 ```
 
@@ -184,8 +184,8 @@ If the feature requires new hook types, add them to `hooks/hooks.json`. Note tha
 - **Default ON unless the feature is purely cosmetic and adds visible noise.** Behavior-changing experimental features (auto-dismiss, instant notify, session status, permission details) default to ON for new installs (`UserDefaults.object == nil` → `set(true, ...)`); the goal is for users to discover and try the feature without hunting in Settings. Purely cosmetic UI additions that *layer extra visual elements onto existing UI* (e.g. session-row badges) MAY default OFF — but the nil-check pattern still applies so the default is recorded explicitly and can be flipped in a future release without a migration. When choosing OFF, note the rationale in the toggle's `didSet` or near its initialization. The four `NaviExp.Show*` toggles (folder/git/mode/model badges) are the canonical example.
 - **Flag files are the source of truth for hooks** — hooks never read UserDefaults
 - **Swift toggles take effect immediately** where possible — the `didSet` writes the flag file and SwiftUI reactivity handles UI changes
-- **Hooks always remain registered in `hooks.json`** — gating is done at runtime via flag files, not by modifying `hooks.json`. This avoids requiring Claude session restarts when toggling.
-- **If a feature requires init-time setup inside Navi** (e.g., `DispatchSource`), pass `requiresRestart: true` to `experimentalRow()`. This sets `floatingManager.pendingRestart = true` on change and shows a restart banner with a "Restart Navi" button.
+- **Prefer runtime flag gating over removing hooks from `hooks.json`** — removing a hook registration requires users to restart Claude sessions to pick up the change, whereas a flag file check takes effect immediately. Only remove a hook registration when it is genuinely obsolete (e.g., its work is fully covered by another mechanism), not merely when it is temporarily unwanted.
+- **If a feature requires init-time setup inside Navi** (e.g., `DispatchSource`), pass `requiresRestart: true` to `settingsRow()`. This sets `floatingManager.pendingRestart = true` on change and shows a restart banner with a "Restart Navi" button.
 - **If a feature requires new hooks in `hooks.json`** (not just gating existing hooks), the version upgrade banner handles the restart hint automatically. On first launch after a plugin update, `FloatingWindowManager` compares `NaviLastVersion` with `naviCurrentVersion` and shows a one-time dismissable banner: "Navi updated — restart Claude sessions for new features".
 
 ## Promoting an Experimental Feature to General Settings
@@ -215,6 +215,60 @@ The flag file mechanism (`/tmp/navi/features/my-feature`) stays — it's not spe
 ### 4. Update the property name (optional)
 
 Rename `myFeatureEnabled` to drop any "experimental" connotation if present. Update all references in `syncFeatureFlags()`, `didSet`, and the UI binding.
+
+## Building External Plugins
+
+Navi's extension API lets you build plugins that surface cards in the floating window without touching this repository. The contract is simple: write a JSON file to `/tmp/navi/events/` and Navi renders it.
+
+### The `info` event type
+
+`info` is the only external event type. It produces a non-interactive, sticky status card — no approve/deny buttons, no permission semantics. Cards stay visible until the user dismisses them (the X button on each row) or your plugin explicitly removes them by writing a `resolve` file.
+
+See [`docs/EXTENSION_API.md`](docs/EXTENSION_API.md) for the full schema, atomicity rules, and security constraints.
+
+### Plugin anatomy
+
+A typical Claude Code hook-based plugin looks like this:
+
+**`hooks/hooks.json`** — register your hook:
+```json
+{
+  "hooks": {
+    "Stop": [{ "type": "command", "command": "bash /path/to/your-plugin/hook.sh" }]
+  }
+}
+```
+
+**`hook.sh`** — check Navi is present, write an info event:
+```bash
+#!/bin/bash
+NAVI_EVENTS="/tmp/navi/events"
+[ -d "$NAVI_EVENTS" ] || exit 0   # no-op if Navi isn't installed
+
+ID="$(date +%s)-$(openssl rand -hex 16)"
+BODY="$(compute_your_message)"    # your logic here
+
+printf '{"id":"%s","timestamp":%s,"type":"info","title":"My Plugin","body":"%s","description":"","session_id":"%s","session_name":"","pid":0,"cwd":"","tty":"","tool_use_id":"","expires":0}\n' \
+  "$ID" "$(date +%s)" "$BODY" "${CLAUDE_SESSION_ID:-}" \
+  > "$NAVI_EVENTS/.${ID}.tmp" \
+&& mv "$NAVI_EVENTS/.${ID}.tmp" "$NAVI_EVENTS/${ID}.json"
+```
+
+The `[ -d "$NAVI_EVENTS" ]` guard is the key compatibility pattern — your plugin silently does nothing when Navi isn't installed, so it's safe to ship in shared dotfiles or team configs.
+
+### Key principles
+
+- **Atomic writes only.** Always write to a `.tmp` file and `mv`/`os.rename` to the final `.json` name. Navi only reads `.json` files so it never sees a partial write.
+- **`session_id` binds the card to a session.** The card shows under that session's row. If the session has already ended, the card renders without a session header.
+- **`body` is trusted display text.** Keep it short, controlled, and free of user-derived input. Put AI-generated or freeform text in `description` — it renders with a distinct italic style to signal it's not authoritative.
+- **`id` nonce must be 128 bits of randomness.** `openssl rand -hex 16` produces exactly that. Never reuse ids.
+- **Cards are sticky.** Unlike other event types, `info` cards don't auto-expire — they stay until dismissed. Design your message to be worth the real estate.
+
+### The built-in context-window alert
+
+`EnrichmentService` is the canonical internal producer. It polls session transcripts, detects when input tokens cross the configured warning/critical thresholds, and injects `info` events directly into `EventMonitor` (bypassing the file pipeline). When context drops back below 140K (e.g. after `/compact`), it resolves the stored event IDs so the cards disappear automatically.
+
+This pattern — produce on crossing, resolve on recovery — is a good model for any plugin that tracks a recoverable condition.
 
 ## Pull Requests
 

@@ -31,7 +31,7 @@ struct SessionSection: View {
     @AppStorage("NaviFontScale") private var s: Double = 1.0
 
     private var shouldExpand: Bool {
-        group.hasPending
+        group.hasPending || group.events.contains { $0.type == "info" && !$0.resolved }
     }
 
     var body: some View {
@@ -197,6 +197,10 @@ struct SessionSection: View {
                                 .background(Color.pastelPurple.opacity(0.30))
                                 .clipShape(Capsule())
                         }
+                        if floatingManager.showContextEnabled,
+                           let tokens = enrichmentService.transcriptInfoBySid[group.info.id]?.contextTokens {
+                            contextBar(tokens: tokens, scale: s)
+                        }
                     }
                     .padding(.horizontal, 10)
                     .padding(.bottom, 4)
@@ -266,6 +270,45 @@ struct SessionSection: View {
                 if a.isRunning != b.isRunning { return a.isRunning }
                 return a.startedAt < b.startedAt
             }
+    }
+
+    // Mini bar showing context window usage. Bar fills from left, color shifts
+    // from teal → yellow → orange → red as tokens approach common thresholds.
+    @ViewBuilder private func contextBar(tokens: Int, scale: Double) -> some View {
+        let warn = floatingManager.contextAlertThreshold1
+        let crit = floatingManager.contextAlertThreshold2
+        let cap = [warn, crit].filter { $0 > 0 }.max() ?? 200_000
+        let fraction = min(Double(tokens) / Double(cap), 1.0)
+        let label: String = {
+            if tokens >= 1_000 { return "\(tokens / 1_000)K" }
+            return "\(tokens)"
+        }()
+        let barColor: Color = {
+            if crit > 0 && tokens >= crit { return .red }
+            if warn > 0 && tokens >= warn { return .orange }
+            return .teal
+        }()
+        let tooltip = "\(tokens.formatted()) input tokens"
+        HStack(spacing: 5) {
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(Color.primary.opacity(0.08))
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(barColor.opacity(0.75))
+                        .frame(width: max(2, geo.size.width * fraction))
+                }
+            }
+            .frame(width: 44, height: 5)
+            Text(label)
+                .font(.system(size: 10 * scale, design: .monospaced))
+                .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 2)
+        .background(Color.primary.opacity(0.06))
+        .cornerRadius(4)
+        .help(tooltip)
     }
 
     private func subagentRow(_ sub: SubagentInfo, isLast: Bool, now: Date) -> some View {

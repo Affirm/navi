@@ -28,6 +28,8 @@ struct ContentView: View {
     @State private var stopSound: String = UserDefaults.standard.string(forKey: "NaviSound.stop.name") ?? "Glass"
     @State private var notificationSoundOn: Bool = UserDefaults.standard.object(forKey: "NaviSound.notification") as? Bool ?? false
     @State private var notificationSound: String = UserDefaults.standard.string(forKey: "NaviSound.notification.name") ?? "Glass"
+    @State private var infoSoundOn: Bool = UserDefaults.standard.object(forKey: "NaviSound.info") as? Bool ?? false
+    @State private var infoSound: String = UserDefaults.standard.string(forKey: "NaviSound.info.name") ?? "Glass"
     @AppStorage("NaviFontScale") private var fontScale: Double = 1.0
     @State private var showSettings = false
 
@@ -215,69 +217,142 @@ struct ContentView: View {
     }
 
     private var generalTab: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Toggle(isOn: $autoLaunch) {
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("Auto-launch Navi")
-                        .font(.system(size: 11))
-                    Text("Automatically launch Navi when Claude triggers a hook event")
+        ScrollView {
+            VStack(alignment: .leading, spacing: 8) {
+                Toggle(isOn: $autoLaunch) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Auto-launch Navi")
+                            .font(.system(size: 11))
+                        Text("Automatically launch Navi when Claude triggers a hook event")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+                .tint(.blue)
+                .onChange(of: autoLaunch) { _, on in
+                    if on {
+                        try? FileManager.default.removeItem(atPath: autoLaunchFlagPath)
+                    } else {
+                        FileManager.default.createFile(atPath: autoLaunchFlagPath, contents: nil)
+                    }
+                }
+
+                Divider()
+
+                Text("Interface")
+                    .font(.system(size: 11, weight: .semibold))
+
+                settingsRow("Menu bar icon", subtitle: "Adds a menu bar icon for Navi.",
+                    isOn: Binding(get: { floatingManager.menuBarEnabled }, set: { floatingManager.menuBarEnabled = $0 }))
+                if floatingManager.menuBarEnabled {
+                    settingsRow("Floating window", subtitle: "Always-on-top floating window.",
+                        isOn: Binding(get: { floatingManager.isFloating }, set: { floatingManager.isFloating = $0 }), indent: true)
+                }
+                settingsRow("Session names", subtitle: "Show the session name (from /rename) instead of the project folder.",
+                    isOn: Binding(get: { floatingManager.sessionNamesEnabled }, set: { floatingManager.sessionNamesEnabled = $0 }))
+                settingsRow("Permission details", subtitle: "Show a \"Show details\" button on permission requests with the full tool input.",
+                    isOn: Binding(get: { floatingManager.permissionDetailsEnabled }, set: { floatingManager.permissionDetailsEnabled = $0 }))
+
+                Divider()
+
+                Text("Session row")
+                    .font(.system(size: 11, weight: .semibold))
+
+                settingsRow("Folder path", subtitle: "Show the working directory for each session.",
+                    isOn: Binding(get: { floatingManager.showFolderEnabled }, set: { floatingManager.showFolderEnabled = $0 }))
+                settingsRow("Git status", subtitle: "Show branch, dirty state, ahead/behind counts, and open PR.",
+                    isOn: Binding(get: { floatingManager.showGitEnabled }, set: { floatingManager.showGitEnabled = $0 }))
+                settingsRow("Claude mode", subtitle: "Show the active permission mode (plan, auto, acceptEdits, bypassPermissions).",
+                    isOn: Binding(get: { floatingManager.showModeEnabled }, set: { floatingManager.showModeEnabled = $0 }))
+                settingsRow("Claude model", subtitle: "Show the model used by each session.",
+                    isOn: Binding(get: { floatingManager.showModelEnabled }, set: { floatingManager.showModelEnabled = $0 }))
+
+                Divider()
+
+                Text("Sounds")
+                    .font(.system(size: 11, weight: .semibold))
+
+                soundRow("Permission", isOn: $permissionSoundOn, sound: $permissionSound, key: "permission")
+                soundRow("Finished", isOn: $stopSoundOn, sound: $stopSound, key: "stop")
+                soundRow("Notification", isOn: $notificationSoundOn, sound: $notificationSound, key: "notification")
+                soundRow("Info", isOn: $infoSoundOn, sound: $infoSound, key: "info")
+
+                Divider()
+
+                Text("Display")
+                    .font(.system(size: 11, weight: .semibold))
+
+                HStack(spacing: 6) {
+                    Text("A")
                         .font(.system(size: 9))
                         .foregroundStyle(.secondary)
+                    Slider(value: $fontScale, in: 0.8...1.4, step: 0.1)
+                        .controlSize(.mini)
+                    Text("A")
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundStyle(.secondary)
                 }
-            }
-            .toggleStyle(.switch)
-            .controlSize(.mini)
-            .tint(.blue)
-            .onChange(of: autoLaunch) { _, on in
-                if on {
-                    try? FileManager.default.removeItem(atPath: autoLaunchFlagPath)
-                } else {
-                    FileManager.default.createFile(atPath: autoLaunchFlagPath, contents: nil)
+
+                Divider()
+
+                Button {
+                    NSApplication.shared.terminate(nil)
+                } label: {
+                    Text("Quit Navi")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.red)
+                        .frame(maxWidth: .infinity)
                 }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
             }
-
-            Divider()
-
-            Text("Sounds")
-                .font(.system(size: 11, weight: .semibold))
-
-            soundRow("Permission", isOn: $permissionSoundOn, sound: $permissionSound, key: "permission")
-            soundRow("Finished", isOn: $stopSoundOn, sound: $stopSound, key: "stop")
-            soundRow("Notification", isOn: $notificationSoundOn, sound: $notificationSound, key: "notification")
-
-            Divider()
-
-            Text("Display")
-                .font(.system(size: 11, weight: .semibold))
-
-            HStack(spacing: 6) {
-                Text("A")
-                    .font(.system(size: 9))
-                    .foregroundStyle(.secondary)
-                Slider(value: $fontScale, in: 0.8...1.4, step: 0.1)
-                    .controlSize(.mini)
-                Text("A")
-                    .font(.system(size: 14, weight: .bold))
-                    .foregroundStyle(.secondary)
-            }
-
-            Divider()
-
-            Button {
-                NSApplication.shared.terminate(nil)
-            } label: {
-                Text("Quit Navi")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.red)
-                    .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
+            .padding(12)
         }
-        .padding(12)
     }
 
-    private func experimentalRow(_ title: String, subtitle: String, isOn: Binding<Bool>, indent: Bool = false, requiresRestart: Bool = false, requiresSessionRestart: Bool = false) -> some View {
+    private var contextAlertThresholdPicker: some View {
+        let t1 = Binding<String>(
+            get: { floatingManager.contextAlertThreshold1 == 0 ? "0" : "\(floatingManager.contextAlertThreshold1 / 1000)" },
+            set: { if let v = Int($0.trimmingCharacters(in: .whitespaces)), v >= 0 { floatingManager.contextAlertThreshold1 = v * 1000 } }
+        )
+        let t2 = Binding<String>(
+            get: { floatingManager.contextAlertThreshold2 == 0 ? "0" : "\(floatingManager.contextAlertThreshold2 / 1000)" },
+            set: { if let v = Int($0.trimmingCharacters(in: .whitespaces)), v >= 0 { floatingManager.contextAlertThreshold2 = v * 1000 } }
+        )
+        return VStack(alignment: .leading, spacing: 4) {
+            thresholdRow(label: "Warning", color: .orange, binding: t1)
+            thresholdRow(label: "Critical", color: .red, binding: t2)
+            Text("Enter K tokens (e.g. 200 = 200K). Set to 0 to disable.")
+                .font(.system(size: 9))
+                .foregroundStyle(.secondary)
+        }
+        .padding(.leading, 16)
+        .padding(.vertical, 2)
+    }
+
+    private func thresholdRow(label: String, color: Color, binding: Binding<String>) -> some View {
+        HStack(spacing: 6) {
+            Circle()
+                .fill(color)
+                .frame(width: 6, height: 6)
+            Text(label)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Spacer()
+            TextField("0", text: binding)
+                .textFieldStyle(.roundedBorder)
+                .font(.caption)
+                .frame(width: 46)
+                .multilineTextAlignment(.trailing)
+            Text("K")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func settingsRow(_ title: String, subtitle: String, isOn: Binding<Bool>, indent: Bool = false, requiresRestart: Bool = false, requiresSessionRestart: Bool = false) -> some View {
         HStack {
             VStack(alignment: .leading, spacing: 1) {
                 Text(title)
@@ -314,39 +389,19 @@ struct ContentView: View {
                 .font(.system(size: 9))
                 .foregroundStyle(.secondary)
 
-            experimentalRow("Menu bar icon", subtitle: "Adds a menu bar icon for Navi.",
-                isOn: Binding(get: { floatingManager.menuBarEnabled }, set: { floatingManager.menuBarEnabled = $0 }))
-
-            if floatingManager.menuBarEnabled {
-                experimentalRow("Floating window", subtitle: "Always-on-top floating window",
-                    isOn: Binding(get: { floatingManager.isFloating }, set: { floatingManager.isFloating = $0 }), indent: true)
-            }
-
-            experimentalRow("Session names", subtitle: "Show session name (from /rename) instead of project folder",
-                isOn: Binding(get: { floatingManager.sessionNamesEnabled }, set: { floatingManager.sessionNamesEnabled = $0 }))
-
-            experimentalRow("Permission details", subtitle: "Show a \"Show details\" button on each permission request that opens a popover with the full tool input.",
-                isOn: Binding(get: { floatingManager.permissionDetailsEnabled }, set: { floatingManager.permissionDetailsEnabled = $0 }))
-
-            Text("Session details")
-                .font(.caption)
-                .foregroundColor(.secondary)
-                .padding(.top, 4)
-
-            experimentalRow("Folder path", subtitle: "Show the working directory for each session.",
-                isOn: Binding(get: { floatingManager.showFolderEnabled }, set: { floatingManager.showFolderEnabled = $0 }))
-
-            experimentalRow("Git status", subtitle: "Show branch, dirty state, ahead/behind counts, and the linked open PR (if `gh` is authenticated).",
-                isOn: Binding(get: { floatingManager.showGitEnabled }, set: { floatingManager.showGitEnabled = $0 }))
-
-            experimentalRow("Claude mode", subtitle: "Show the active permission mode (plan, auto, acceptEdits, bypassPermissions).",
-                isOn: Binding(get: { floatingManager.showModeEnabled }, set: { floatingManager.showModeEnabled = $0 }))
-
-            experimentalRow("Claude model", subtitle: "Show the model used by each session (e.g. opus-4-7, sonnet-4-6).",
-                isOn: Binding(get: { floatingManager.showModelEnabled }, set: { floatingManager.showModelEnabled = $0 }))
-
-            experimentalRow("Sub-agents", subtitle: "Show sub-agents (Task tool) as a tree nested under the parent session that spawned them.",
+            settingsRow("Sub-agents", subtitle: "Show sub-agents (Task tool) as a tree nested under the parent session that spawned them.",
                 isOn: Binding(get: { floatingManager.showSubagentsEnabled }, set: { floatingManager.showSubagentsEnabled = $0 }))
+
+            settingsRow("Context size", subtitle: "Show a mini bar indicating context window usage (teal → yellow → orange → red at 150K/200K/400K tokens).",
+                isOn: Binding(get: { floatingManager.showContextEnabled }, set: { floatingManager.showContextEnabled = $0 }))
+
+            settingsRow("Context window alerts",
+                subtitle: "Notify when a session crosses the configured thresholds, recommending /compact or a new session.",
+                isOn: Binding(get: { floatingManager.contextAlertsEnabled }, set: { floatingManager.contextAlertsEnabled = $0 }))
+
+            if floatingManager.contextAlertsEnabled {
+                contextAlertThresholdPicker
+            }
 
             Spacer()
         }

@@ -48,9 +48,20 @@ final class EnrichmentService: ObservableObject, SessionEnrichmentProvider {
     private var ghProbeDone: Bool = false
 
     unowned let floatingManager: FloatingWindowManager
+    private weak var monitor: EventMonitor?
+
+    /// Per-session highest alert level seen (0 = none, 1 = first threshold, 2 = second).
+    /// In-memory only — resets on Navi restart, which is acceptable for informational alerts.
+    private var contextAlertLevels: [String: Int] = [:]
+    private var contextAlertEventIDs: [String: [String]] = [:]
+    private static let contextAlertResetFloor = 140_000
 
     init(floatingManager: FloatingWindowManager) {
         self.floatingManager = floatingManager
+    }
+
+    func attach(monitor: EventMonitor) {
+        self.monitor = monitor
     }
 
     static func prKey(cwd: String, branch: String) -> String {
@@ -68,7 +79,7 @@ final class EnrichmentService: ObservableObject, SessionEnrichmentProvider {
         if floatingManager.showGitEnabled {
             scheduleGitRefresh(cwd: cwd)
         }
-        if floatingManager.showModeEnabled || floatingManager.showModelEnabled,
+        if (floatingManager.showModeEnabled || floatingManager.showModelEnabled || floatingManager.showContextEnabled || floatingManager.contextAlertsEnabled),
            !session.id.isEmpty {
             scheduleTranscriptRefresh(sessionID: session.id, cwd: cwd)
         }
@@ -471,21 +482,31 @@ final class EnrichmentService: ObservableObject, SessionEnrichmentProvider {
 
         var model: String? = nil
         var permissionMode: String? = nil
+        var contextTokens: Int? = nil
         var consecutiveParseFailures = 0
         var maxConsecutiveFailures = 0
         for line in lines.reversed() {
-            if model != nil && permissionMode != nil { break }
+            if model != nil && permissionMode != nil && contextTokens != nil { break }
             guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else {
                 consecutiveParseFailures += 1
                 maxConsecutiveFailures = max(maxConsecutiveFailures, consecutiveParseFailures)
                 continue
             }
             consecutiveParseFailures = 0
-            if model == nil,
-               let message = obj["message"] as? [String: Any],
-               (message["role"] as? String) == "assistant",
-               let m = message["model"] as? String, !m.isEmpty {
-                model = m
+            if let message = obj["message"] as? [String: Any],
+               (obj["type"] as? String) == "assistant" || (message["role"] as? String) == "assistant" {
+                if model == nil, let m = message["model"] as? String, !m.isEmpty {
+                    model = m
+                }
+                // Sum all input-side token counters; bare input_tokens alone understates
+                // context by orders of magnitude when prompt caching is active.
+                if contextTokens == nil, let usage = message["usage"] as? [String: Any] {
+                    let input  = usage["input_tokens"] as? Int ?? 0
+                    let cread  = usage["cache_read_input_tokens"] as? Int ?? 0
+                    let ccreate = usage["cache_creation_input_tokens"] as? Int ?? 0
+                    let total = input + cread + ccreate
+                    if total > 0 { contextTokens = total }
+                }
             }
             if permissionMode == nil {
                 if let pm = obj["permissionMode"] as? String, !pm.isEmpty {
@@ -504,16 +525,63 @@ final class EnrichmentService: ObservableObject, SessionEnrichmentProvider {
         }
 
         let existing = transcriptCache[sessionID]
-        if model == nil && permissionMode == nil && existing == nil {
+        if model == nil && permissionMode == nil && contextTokens == nil && existing == nil {
             return
         }
 
-        let newInfo = TranscriptInfo(model: model, permissionMode: permissionMode, fetchedAt: Date())
+        let newInfo = TranscriptInfo(model: model, permissionMode: permissionMode, contextTokens: contextTokens, fetchedAt: Date())
         if existing == newInfo { return }
         transcriptCache[sessionID] = newInfo
+
+        if floatingManager.contextAlertsEnabled, let tokens = contextTokens {
+            checkContextAlert(sessionID: sessionID, tokens: tokens, cwd: cwd)
+        }
+
         DispatchQueue.main.async { [weak self] in
             self?.transcriptInfoBySid[sessionID] = newInfo
         }
+    }
+
+    private func checkContextAlert(sessionID: String, tokens: Int, cwd: String) {
+        let t1 = floatingManager.contextAlertThreshold1
+        let t2 = floatingManager.contextAlertThreshold2
+        let thresholds = [t1, t2].filter { $0 > 0 }.sorted()
+
+        let current = contextAlertLevels[sessionID] ?? 0
+
+        if tokens < Self.contextAlertResetFloor && current > 0 {
+            contextAlertLevels[sessionID] = 0
+            if let ids = contextAlertEventIDs.removeValue(forKey: sessionID) {
+                ids.forEach { monitor?.dismiss($0) }
+            }
+            return
+        }
+
+        let newLevel = thresholds.filter { tokens >= $0 }.count
+        guard newLevel > current else { return }
+        contextAlertLevels[sessionID] = newLevel
+
+        let crossedK = thresholds[newLevel - 1] / 1_000
+        let tokensK = tokens / 1_000
+        let ts = Date()
+        let alertID = "\(Int(ts.timeIntervalSince1970))-\(UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased())"
+        contextAlertEventIDs[sessionID, default: []].append(alertID)
+        let event = NaviEvent(
+            id: alertID,
+            timestamp: ts,
+            type: "info",
+            title: "Context window",
+            body: "\(tokensK)K tokens — past \(crossedK)K threshold. Consider /compact or starting a new session.",
+            description: "",
+            sessionID: sessionID,
+            sessionName: "",
+            pid: 0,
+            cwd: cwd,
+            tty: "",
+            toolUseID: "",
+            expires: nil
+        )
+        monitor?.receiveAlert(event)
     }
 
     private func scheduleSubagentsRefresh(sessionID: String, cwd: String) {
