@@ -98,6 +98,10 @@ public class EventMonitor: ObservableObject {
                                 self.events[i].response = "dismissed"
                             }
                         }
+                        // info cards are never isPending; resolve them by id directly.
+                        if let eid = eid, !eid.isEmpty {
+                            self.events.removeAll { $0.type == "info" && $0.id == eid }
+                        }
                     }
                 }
                 try? fm.removeItem(atPath: path)
@@ -163,10 +167,11 @@ public class EventMonitor: ObservableObject {
                         self.events[i].response = "dismissed"
                     }
                 }
-                // Keep only the latest event per session (preserve pending permissions).
-                // Info events are additive — they don't displace the current stop/notification card.
+                // Keep only the latest event per session (preserve pending permissions and
+                // sticky info cards). Info events are additive — they don't displace the
+                // current stop/notification card, and non-info events don't displace info cards.
                 if event.type != "info" {
-                    self.events.removeAll { $0.sessionID == event.sessionID && !$0.isPending }
+                    self.events.removeAll { $0.sessionID == event.sessionID && !$0.isPending && $0.type != "info" }
                 }
                 self.events.insert(event, at: 0)
             }

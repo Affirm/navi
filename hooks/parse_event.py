@@ -31,6 +31,8 @@ def feature_config(name, default=None):
     except (FileNotFoundError, OSError, json.JSONDecodeError):
         return default
 
+
+
 d = json.load(sys.stdin)
 event_name = d.get("hook_event_name", "")
 

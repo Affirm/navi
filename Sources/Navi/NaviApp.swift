@@ -33,6 +33,7 @@ struct NaviApp: App {
             ContentView(monitor: monitor, floatingManager: floatingManager, enrichmentService: enrichmentService, isFloatingWindow: true)
                 .onAppear {
                     monitor.attach(enrichmentService: enrichmentService)
+                    enrichmentService.attach(monitor: monitor)
                     menuBar.attach(monitor: monitor, floatingManager: floatingManager, enrichmentService: enrichmentService)
                     if floatingManager.menuBarEnabled { menuBar.enable() }
                 }

@@ -58,8 +58,27 @@ class FloatingWindowManager: ObservableObject {
         didSet { UserDefaults.standard.set(showSubagentsEnabled, forKey: "NaviExp.ShowSubagents") }
     }
 
+    @Published var showContextEnabled: Bool {
+        didSet { UserDefaults.standard.set(showContextEnabled, forKey: "NaviExp.ShowContext") }
+    }
+
+    @Published var contextAlertsEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(contextAlertsEnabled, forKey: "NaviExp.ContextAlerts")
+            FeatureFlags.set("context-alerts", enabled: contextAlertsEnabled)
+        }
+    }
+
+    @Published var contextAlertThreshold1: Int {
+        didSet { UserDefaults.standard.set(contextAlertThreshold1, forKey: "NaviExp.ContextAlert.T1") }
+    }
+
+    @Published var contextAlertThreshold2: Int {
+        didSet { UserDefaults.standard.set(contextAlertThreshold2, forKey: "NaviExp.ContextAlert.T2") }
+    }
+
     var anyEnrichmentToggleOn: Bool {
-        showFolderEnabled || showGitEnabled || showModeEnabled || showModelEnabled || showSubagentsEnabled
+        showFolderEnabled || showGitEnabled || showModeEnabled || showModelEnabled || showSubagentsEnabled || showContextEnabled || contextAlertsEnabled
     }
 
     /// Width for the menu-bar popover. The floating window is user-resizable,
@@ -85,6 +104,7 @@ class FloatingWindowManager: ObservableObject {
         FeatureFlags.set("menu-bar", enabled: menuBarEnabled)
         FeatureFlags.set("session-names", enabled: sessionNamesEnabled)
         FeatureFlags.set("permission-details", enabled: permissionDetailsEnabled)
+        FeatureFlags.set("context-alerts", enabled: contextAlertsEnabled)
         // Core features — always enabled. Flag files written so hooks that
         // still gate on `/tmp/navi/features/<name>` continue to work.
         FeatureFlags.set("terminal-focus", enabled: true)
@@ -167,6 +187,22 @@ class FloatingWindowManager: ObservableObject {
             showSubagentsEnabled = false
         } else {
             showSubagentsEnabled = UserDefaults.standard.bool(forKey: "NaviExp.ShowSubagents")
+        }
+        if UserDefaults.standard.object(forKey: "NaviExp.ContextAlerts") == nil {
+            UserDefaults.standard.set(false, forKey: "NaviExp.ContextAlerts")
+            contextAlertsEnabled = false
+        } else {
+            contextAlertsEnabled = UserDefaults.standard.bool(forKey: "NaviExp.ContextAlerts")
+        }
+        contextAlertThreshold1 = UserDefaults.standard.object(forKey: "NaviExp.ContextAlert.T1") != nil
+            ? UserDefaults.standard.integer(forKey: "NaviExp.ContextAlert.T1") : 200_000
+        contextAlertThreshold2 = UserDefaults.standard.object(forKey: "NaviExp.ContextAlert.T2") != nil
+            ? UserDefaults.standard.integer(forKey: "NaviExp.ContextAlert.T2") : 400_000
+        if UserDefaults.standard.object(forKey: "NaviExp.ShowContext") == nil {
+            UserDefaults.standard.set(false, forKey: "NaviExp.ShowContext")
+            showContextEnabled = false
+        } else {
+            showContextEnabled = UserDefaults.standard.bool(forKey: "NaviExp.ShowContext")
         }
         // Clean up legacy feature flag files from removed options. Manual resize
         // became permanent in 1.1.x — no longer a toggle.
