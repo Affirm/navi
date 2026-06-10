@@ -382,6 +382,11 @@ final class EnrichmentService: ObservableObject, SessionEnrichmentProvider {
                     self?.subagentsBySid.removeValue(forKey: sessionID)
                 }
             }
+            self.contextAlertLevels.removeValue(forKey: sessionID)
+            if let alertIDs = self.contextAlertEventIDs.removeValue(forKey: sessionID) {
+                let monitor = self.monitor
+                DispatchQueue.main.async { alertIDs.forEach { monitor?.dismiss($0) } }
+            }
         }
     }
 

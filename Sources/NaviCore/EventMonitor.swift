@@ -224,7 +224,16 @@ public class EventMonitor: ObservableObject {
             // sessions dir couldn't be read (nil), so a transient FS error
             // never wipes live sessions.
             if let liveSessionIDs {
+                let before = Set(self.sessions.keys)
                 self.sessions = self.sessions.filter { $0.value.isAlive(among: liveSessionIDs) }
+                let pruned = before.subtracting(self.sessions.keys)
+                if !pruned.isEmpty {
+                    self.events.removeAll { $0.type == "info" && pruned.contains($0.sessionID) }
+                    if let svc = self.enrichmentService {
+                        pruned.forEach { svc.evict(sessionID: $0) }
+                        svc.evictUnused(activeCwds: Set(self.sessions.values.map(\.cwd)))
+                    }
+                }
             }
 
             // Check if build.sh rebuilt a newer version while we're running

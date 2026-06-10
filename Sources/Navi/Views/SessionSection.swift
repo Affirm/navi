@@ -273,10 +273,12 @@ struct SessionSection: View {
     }
 
     // Mini bar showing context window usage. Bar fills from left, color shifts
-    // from teal → yellow → orange → red as tokens approach common thresholds.
+    // teal → orange → red as tokens cross the configured warning/critical thresholds.
     @ViewBuilder private func contextBar(tokens: Int, scale: Double) -> some View {
         let warn = floatingManager.contextAlertThreshold1
         let crit = floatingManager.contextAlertThreshold2
+        // Falls back to 200K when both thresholds are 0 (alerts disabled) — a reasonable
+        // reference size so the bar still shows relative usage with a teal neutral color.
         let cap = [warn, crit].filter { $0 > 0 }.max() ?? 200_000
         let fraction = min(Double(tokens) / Double(cap), 1.0)
         let label: String = {
