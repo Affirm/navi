@@ -392,7 +392,7 @@ struct ContentView: View {
             settingsRow("Sub-agents", subtitle: "Show sub-agents (Task tool) as a tree nested under the parent session that spawned them.",
                 isOn: Binding(get: { floatingManager.showSubagentsEnabled }, set: { floatingManager.showSubagentsEnabled = $0 }))
 
-            settingsRow("Context size", subtitle: "Show a mini bar indicating context window usage (teal → yellow → orange → red at 150K/200K/400K tokens).",
+            settingsRow("Context size", subtitle: "Show a mini bar indicating context window usage. Color reflects configured alert thresholds: teal (below warning), orange (warning), red (critical).",
                 isOn: Binding(get: { floatingManager.showContextEnabled }, set: { floatingManager.showContextEnabled = $0 }))
 
             settingsRow("Context window alerts",

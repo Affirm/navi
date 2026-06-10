@@ -173,9 +173,12 @@ public class EventMonitor: ObservableObject {
                 if event.type != "info" {
                     self.events.removeAll { $0.sessionID == event.sessionID && !$0.isPending && $0.type != "info" }
                 }
+                // Stop events update session state and clear stale cards (above) but don't
+                // add a card themselves — the session header's Idle status covers it.
+                guard event.type != "stop" else { return }
                 self.events.insert(event, at: 0)
             }
-            newEventTypes.insert(event.type)
+            if event.type != "stop" { newEventTypes.insert(event.type) }
             try? fm.removeItem(atPath: path)
         }
 
@@ -221,7 +224,16 @@ public class EventMonitor: ObservableObject {
             // sessions dir couldn't be read (nil), so a transient FS error
             // never wipes live sessions.
             if let liveSessionIDs {
+                let before = Set(self.sessions.keys)
                 self.sessions = self.sessions.filter { $0.value.isAlive(among: liveSessionIDs) }
+                let pruned = before.subtracting(self.sessions.keys)
+                if !pruned.isEmpty {
+                    self.events.removeAll { !$0.isPending && pruned.contains($0.sessionID) }
+                    if let svc = self.enrichmentService {
+                        pruned.forEach { svc.evict(sessionID: $0) }
+                        svc.evictUnused(activeCwds: Set(self.sessions.values.map(\.cwd)))
+                    }
+                }
             }
 
             // Check if build.sh rebuilt a newer version while we're running
