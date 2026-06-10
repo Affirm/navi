@@ -173,6 +173,9 @@ public class EventMonitor: ObservableObject {
                 if event.type != "info" {
                     self.events.removeAll { $0.sessionID == event.sessionID && !$0.isPending && $0.type != "info" }
                 }
+                // Stop events update session state and clear stale cards (above) but don't
+                // add a card themselves — the session header's Idle status covers it.
+                guard event.type != "stop" else { return }
                 self.events.insert(event, at: 0)
             }
             newEventTypes.insert(event.type)
