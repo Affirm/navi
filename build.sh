@@ -39,13 +39,41 @@ if [ -x "$BINARY" ] && [ -f "$BUILT_VERSION_FILE" ] && [ "$(cat "$BUILT_VERSION_
     exit 0
 fi
 
+# Prevent concurrent installs: mkdir is atomic; only one caller succeeds.
+# Reclaim stale lock if the holder is gone, pid is missing/non-numeric, or lock is old.
+mkdir -p /tmp/navi
+chmod 700 /tmp/navi 2>/dev/null || true
+LOCK_DIR="/tmp/navi/build.lock"
+LOCK_MAX_AGE_SECONDS=600
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    HOLDER_PID=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
+    LOCK_IS_STALE=false
+    case "$HOLDER_PID" in
+        ''|*[!0-9]*) LOCK_IS_STALE=true ;;
+        *) kill -0 "$HOLDER_PID" 2>/dev/null || LOCK_IS_STALE=true ;;
+    esac
+    if [ "$LOCK_IS_STALE" = false ]; then
+        NOW=$(date +%s)
+        LOCK_MTIME=$(stat -f %m "$LOCK_DIR" 2>/dev/null || echo "$NOW")
+        [ $((NOW - LOCK_MTIME)) -gt "$LOCK_MAX_AGE_SECONDS" ] && LOCK_IS_STALE=true
+    fi
+    if [ "$LOCK_IS_STALE" = true ]; then
+        rm -rf "$LOCK_DIR"
+        mkdir "$LOCK_DIR" 2>/dev/null || exit 0
+    else
+        exit 0
+    fi
+fi
+echo "$$" > "$LOCK_DIR/pid"
+trap 'rm -rf "$LOCK_DIR"' EXIT
+
 RELEASE_TAG="v$TARGET_VERSION"
 ZIP_NAME="Navi.app.zip"
 CHECKSUMS_NAME="checksums.txt"
 RELEASE_BASE="https://github.com/$REPO_SLUG/releases/download/$RELEASE_TAG"
 
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+trap 'rm -rf "$TMP" "$LOCK_DIR"' EXIT
 
 echo "Fetching Navi $RELEASE_TAG from $REPO_SLUG..." >&2
 
