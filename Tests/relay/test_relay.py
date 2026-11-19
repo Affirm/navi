@@ -137,8 +137,12 @@ class RelayTests(unittest.TestCase):
             r.next("event", timeout=0.3)
 
     def test_heartbeat_lists_only_live_sessions(self):
+        # A live process whose command line mentions claude (the relay checks
+        # /proc/<pid>/cmdline on Linux to filter out reused PIDs).
+        fake = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", "claude"])
+        self.addCleanup(lambda: (fake.kill(), fake.wait()))
         with open(os.path.join(self.sessions, "1.json"), "w") as f:
-            json.dump({"sessionId": "alive", "pid": os.getpid(), "cwd": "/w/p", "status": "idle",
+            json.dump({"sessionId": "alive", "pid": fake.pid, "cwd": "/w/p", "status": "idle",
                        "updatedAt": 1700000000000, "secret": "not forwarded"}, f)
         with open(os.path.join(self.sessions, "2.json"), "w") as f:
             json.dump({"sessionId": "dead", "pid": 2 ** 22 + 12345}, f)
@@ -148,6 +152,19 @@ class RelayTests(unittest.TestCase):
         self.assertEqual(beat["sessions"][0]["cwd"], "/w/p")
         self.assertNotIn("secret", beat["sessions"][0])
         self.assertTrue(os.path.exists(os.path.join(self.root, "relay.alive")))
+
+    def test_pid_reused_by_non_claude_process_is_not_live(self):
+        # Import relay.py as a module to unit-test scan_sessions directly.
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("navi_relay", RELAY)
+        relay = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(relay)
+        with open(os.path.join(self.sessions, "1.json"), "w") as f:
+            json.dump({"sessionId": "ghost", "pid": os.getpid()}, f)
+        live = relay.scan_sessions(self.sessions, is_claude=lambda pid: False)
+        self.assertEqual(live, [])
+        live = relay.scan_sessions(self.sessions, is_claude=lambda pid: True)
+        self.assertEqual([s["sessionId"] for s in live], ["ghost"])
 
     def test_missing_sessions_dir_means_no_sessions(self):
         os.rmdir(self.sessions)

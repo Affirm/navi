@@ -115,7 +115,23 @@ def sync_features(features_dir, enabled):
                 pass
 
 
-def scan_sessions(sessions_dir):
+def looks_like_claude(pid):
+    """Guard against PID reuse: a stale ~/.claude/sessions/<pid>.json whose
+    PID now belongs to some other process would otherwise show up as a live
+    ghost session. On Linux, require "claude" in the process command line.
+    Without /proc (macOS, BSD) there's nothing to check, so accept."""
+    proc = "/proc/{}".format(pid)
+    if not os.path.isdir("/proc/self"):
+        return True
+    try:
+        with open(proc + "/cmdline", "rb") as f:
+            cmdline = f.read().replace(b"\0", b" ").lower()
+    except OSError:
+        return False  # gone, or not ours to read
+    return b"claude" in cmdline
+
+
+def scan_sessions(sessions_dir, is_claude=looks_like_claude):
     """Live Claude sessions from ~/.claude/sessions/*.json (pid must be running)."""
     live = []
     try:
@@ -144,6 +160,8 @@ def scan_sessions(sessions_dir):
             continue
         except PermissionError:
             pass  # exists, owned by someone else
+        if not is_claude(pid):
+            continue
         entry = {"sessionId": sid, "pid": pid}
         for key in ("cwd", "name", "status"):
             if isinstance(d.get(key), str):

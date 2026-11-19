@@ -380,3 +380,28 @@ struct FinishedHighlightTests {
         #expect(await eventuallyOnMain { monitor.sessions[key]?.finishedUnseen == false })
     }
 }
+
+@Suite("Dismiss persistence", .serialized)
+struct DismissPersistenceTests {
+    @Test func dismissedLiveSessionStaysHiddenUntilNewActivity() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("navi-test-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let monitor = EventMonitor(stateDir: dir.path, watch: false)
+        let key = SessionKey(origin: "devbox", sessionID: "s1")
+        let beat = { monitor.applyRemoteHeartbeat(origin: "devbox",
+            sessions: [DiscoveredSession(sessionID: "s1", pid: 5, alive: true)], live: ["s1"]) }
+        beat()
+        #expect(await eventuallyOnMain { monitor.sessions[key] != nil })
+        monitor.dismissSession(key)
+        #expect(await eventuallyOnMain { monitor.sessions[key] == nil })
+        beat()
+        try await Task.sleep(nanoseconds: 100_000_000)
+        #expect(await MainActor.run { monitor.sessions[key] } == nil)
+
+        // New activity brings it back.
+        monitor.ingestRemoteEvent(["id": "9-" + String(repeating: "b", count: 32), "type": "stop",
+                                   "session_id": "s1"], origin: "devbox")
+        #expect(await eventuallyOnMain { monitor.sessions[key] != nil })
+        #expect(await MainActor.run { monitor.dismissed.isEmpty })
+    }
+}

@@ -20,7 +20,9 @@ payload() {
 case "$cmd" in
     start)
         mkdir -p "$STATE" "$HOME/.claude/sessions" "$HOME/demo-project"
-        nohup sleep infinity >/dev/null 2>&1 &
+        # argv[0] mentions claude: the relay ignores PIDs whose command line
+        # doesn't (guards against stale session files with reused PIDs).
+        nohup bash -c 'exec -a claude-fake-session sleep infinity' >/dev/null 2>&1 &
         pid=$!
         id="fake-$(python3 -c 'import secrets;print(secrets.token_hex(8))')"
         echo "$id" > "$STATE/sid"; echo "$pid" > "$STATE/pid"

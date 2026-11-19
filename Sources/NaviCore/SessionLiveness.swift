@@ -81,11 +81,14 @@ public enum SessionReconciler {
         origin: String,
         into sessions: inout [SessionKey: SessionInfo],
         now: Date = Date(),
-        ttyLookup: (pid_t) -> String = { _ in "" }
+        ttyLookup: (pid_t) -> String = { _ in "" },
+        skip: Set<SessionKey> = []
     ) -> [SessionKey] {
         var added: [SessionKey] = []
         for d in discovered {
             let key = SessionKey(origin: origin, sessionID: d.sessionID)
+            // Dismissed by the user (✕): don't re-add it from discovery.
+            if skip.contains(key) { continue }
             if sessions[key] != nil {
                 sessions[key]!.claudeStatus = d.claudeStatus
                 sessions[key]!.statusUpdatedAt = d.statusUpdatedAt
@@ -111,6 +114,16 @@ public enum SessionReconciler {
             added.append(key)
         }
         return added
+    }
+
+    /// Drop dismissals for sessions that are gone, so a dismissal doesn't
+    /// outlive the session it hid. Origins without a `.live` set are kept.
+    public static func pruneDismissed(_ dismissed: Set<SessionKey>,
+                                      liveness: [String: OriginLiveness]) -> Set<SessionKey> {
+        dismissed.filter { key in
+            if case .live(let ids)? = liveness[key.origin] { return ids.contains(key.sessionID) }
+            return true
+        }
     }
 
     public struct PruneResult: Equatable {

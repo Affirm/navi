@@ -188,3 +188,24 @@ struct SessionLivenessTests {
         #expect(local.sessionKey.isLocal)
     }
 }
+
+@Suite("Dismissed sessions")
+struct DismissedSessionTests {
+    @Test func mergeSkipsDismissed() {
+        var t: [SessionKey: SessionInfo] = [:]
+        let added = SessionReconciler.merge(
+            [DiscoveredSession(sessionID: "a", pid: 1, alive: true),
+             DiscoveredSession(sessionID: "b", pid: 2, alive: true)],
+            origin: "devbox", into: &t, skip: [SessionKey(origin: "devbox", sessionID: "a")])
+        #expect(added == [SessionKey(origin: "devbox", sessionID: "b")])
+    }
+
+    @Test func pruneDismissedDropsEndedSessionsOnly() {
+        let a = SessionKey(origin: "devbox", sessionID: "a")
+        let b = SessionKey(origin: "devbox", sessionID: "b")
+        let l = SessionKey(sessionID: "l")
+        let kept = SessionReconciler.pruneDismissed([a, b, l], liveness: ["devbox": .live(["a"]), "": .unknown])
+        #expect(kept == [a, l])
+        #expect(SessionReconciler.pruneDismissed([a], liveness: ["devbox": .disconnected]) == [a])
+    }
+}

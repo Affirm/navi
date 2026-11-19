@@ -17,6 +17,10 @@ public class EventMonitor: ObservableObject, RemoteEventSink {
     /// Liveness reported by remote origins (keyed by host alias). The local
     /// origin's liveness is recomputed from the PID scan on every poll.
     private var remoteLiveness: [String: OriginLiveness] = [:]
+    /// Sessions the user dismissed (✕) while they were still alive. Discovery
+    /// and heartbeats skip them; new activity (an event or a new turn) brings
+    /// them back, and the entry is dropped once the session ends.
+    private(set) var dismissed = Set<SessionKey>()
     public weak var enrichmentService: (any SessionEnrichmentProvider)?
     /// Delivers approve/deny for permission cards from remote origins.
     public weak var remoteResponder: (any RemoteResponder)?
@@ -214,7 +218,7 @@ public class EventMonitor: ObservableObject, RemoteEventSink {
         }
         let added = SessionReconciler.merge(
             discovered, origin: "", into: &sessions,
-            ttyLookup: EventMonitor.lookupTTY)
+            ttyLookup: EventMonitor.lookupTTY, skip: dismissed)
         for key in added {
             if let info = sessions[key] { enrichmentService?.refresh(for: info) }
         }
@@ -321,6 +325,8 @@ public class EventMonitor: ObservableObject, RemoteEventSink {
     /// UserPromptSubmit signals: the session started a new turn.
     private func applyWorking(_ keys: Set<SessionKey>) {
         for key in keys {
+            // A new turn is new activity: let a dismissed session come back.
+            dismissed.remove(key)
             if sessions[key] != nil {
                 sessions[key]!.finishedUnseen = false
                 sessions[key]!.lastEventType = "working"
@@ -336,6 +342,7 @@ public class EventMonitor: ObservableObject, RemoteEventSink {
 
     /// Apply per-origin liveness and clean up after pruned sessions.
     private func reconcile(liveness: [String: OriginLiveness]) {
+        dismissed = SessionReconciler.pruneDismissed(dismissed, liveness: liveness)
         var table = sessions
         let result = SessionReconciler.prune(&table, liveness: liveness)
         guard result.changed else { return }
@@ -374,6 +381,8 @@ public class EventMonitor: ObservableObject, RemoteEventSink {
     private func updateSession(for event: NaviEvent) {
         guard !event.sessionID.isEmpty else { return }
         let sid = event.sessionKey
+        // A real event (not a passive info card) brings a dismissed session back.
+        if event.type != "info" { dismissed.remove(sid) }
 
         if sessions[sid] == nil {
             // Don't create a phantom session entry for external info events —
@@ -462,7 +471,7 @@ public class EventMonitor: ObservableObject, RemoteEventSink {
     public func applyRemoteHeartbeat(origin: String, sessions discovered: [DiscoveredSession], live: Set<String>?) {
         guard !origin.isEmpty else { return }
         DispatchQueue.main.async {
-            SessionReconciler.merge(discovered, origin: origin, into: &self.sessions)
+            SessionReconciler.merge(discovered, origin: origin, into: &self.sessions, skip: self.dismissed)
             self.remoteLiveness[origin] = live.map { .live($0) } ?? .unknown
         }
     }
@@ -480,6 +489,7 @@ public class EventMonitor: ObservableObject, RemoteEventSink {
         guard !origin.isEmpty else { return }
         DispatchQueue.main.async {
             self.remoteLiveness.removeValue(forKey: origin)
+            self.dismissed = self.dismissed.filter { $0.origin != origin }
             self.events.removeAll { $0.origin == origin }
             self.sessions = self.sessions.filter { $0.key.origin != origin }
         }
@@ -518,6 +528,8 @@ public class EventMonitor: ObservableObject, RemoteEventSink {
             guard let self = self else { return }
             self.events.removeAll { $0.sessionKey == key && !$0.isPending }
             self.sessions.removeValue(forKey: key)
+            // Keep it hidden until it does something new (see `dismissed`).
+            self.dismissed.insert(key)
             // Tell the enrichment service to drop caches for this sid and any
             // cwds no longer referenced. Without this, gitCache /
             // transcriptCache / prCache (and their @Published mirrors) grow
@@ -543,6 +555,7 @@ public class EventMonitor: ObservableObject, RemoteEventSink {
             guard let self = self else { return }
             let dismissed = Array(self.sessions.keys)
             self.events.removeAll { !$0.isPending }
+            self.dismissed.formUnion(self.sessions.keys)
             self.sessions.removeAll()
             self.evictEnrichment(for: dismissed)
         }
