@@ -77,6 +77,12 @@ class FloatingWindowManager: ObservableObject {
         didSet { UserDefaults.standard.set(contextAlertThreshold2, forKey: "NaviExp.ContextAlert.T2") }
     }
 
+    /// Pulse a session row after its turn ends until the user clicks it.
+    /// Default ON: it's the "your session finished" signal, not decoration.
+    @Published var highlightFinishedEnabled: Bool {
+        didSet { UserDefaults.standard.set(highlightFinishedEnabled, forKey: "Navi.HighlightFinished") }
+    }
+
     /// Remote hosts (experimental, default OFF): monitor Claude Code sessions
     /// on the user's own servers over SSH. See RemoteBridge.
     @Published var remoteHostsEnabled: Bool {
@@ -227,6 +233,12 @@ class FloatingWindowManager: ObservableObject {
             showContextEnabled = false
         } else {
             showContextEnabled = UserDefaults.standard.bool(forKey: "NaviExp.ShowContext")
+        }
+        if UserDefaults.standard.object(forKey: "Navi.HighlightFinished") == nil {
+            UserDefaults.standard.set(true, forKey: "Navi.HighlightFinished")
+            highlightFinishedEnabled = true
+        } else {
+            highlightFinishedEnabled = UserDefaults.standard.bool(forKey: "Navi.HighlightFinished")
         }
         // Remote hosts — default OFF: it opens SSH connections, so it must be
         // an explicit opt-in. Nil-check pattern so the default is recorded.

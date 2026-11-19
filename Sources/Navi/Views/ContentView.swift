@@ -250,6 +250,8 @@ struct ContentView: View {
                     settingsRow("Floating window", subtitle: "Always-on-top floating window.",
                         isOn: Binding(get: { floatingManager.isFloating }, set: { floatingManager.isFloating = $0 }), indent: true)
                 }
+                settingsRow("Highlight finished sessions", subtitle: "Pulse a session after it finishes responding until you click it.",
+                    isOn: Binding(get: { floatingManager.highlightFinishedEnabled }, set: { floatingManager.highlightFinishedEnabled = $0 }))
                 settingsRow("Session names", subtitle: "Show the session name (from /rename) instead of the project folder.",
                     isOn: Binding(get: { floatingManager.sessionNamesEnabled }, set: { floatingManager.sessionNamesEnabled = $0 }))
                 settingsRow("Permission details", subtitle: "Show a \"Show details\" button on permission requests with the full tool input.",

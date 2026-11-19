@@ -322,6 +322,7 @@ public class EventMonitor: ObservableObject, RemoteEventSink {
     private func applyWorking(_ keys: Set<SessionKey>) {
         for key in keys {
             if sessions[key] != nil {
+                sessions[key]!.finishedUnseen = false
                 sessions[key]!.lastEventType = "working"
                 sessions[key]!.lastActivity = Date()
             }
@@ -390,6 +391,7 @@ public class EventMonitor: ObservableObject, RemoteEventSink {
                 lastActivity: event.timestamp,
                 origin: event.origin
             )
+            if event.type == "stop" { sessions[sid]!.finishedUnseen = true }
         } else {
             sessions[sid]!.lastActivity = event.timestamp
             // Only Stop transitions to idle. Other events (notification,
@@ -397,6 +399,7 @@ public class EventMonitor: ObservableObject, RemoteEventSink {
             // prevents mid-turn notifications from flipping to "Waiting".
             if event.type == "stop" {
                 sessions[sid]!.lastEventType = "stop"
+                sessions[sid]!.finishedUnseen = true
             }
             if event.pid > 0 {
                 sessions[sid]!.pid = event.pid
@@ -410,6 +413,12 @@ public class EventMonitor: ObservableObject, RemoteEventSink {
         if let info = sessions[sid], info.isLocal {
             enrichmentService?.refresh(for: info)
         }
+    }
+
+    /// The user clicked the session: stop highlighting it as finished.
+    public func acknowledge(_ key: SessionKey) {
+        guard sessions[key]?.finishedUnseen == true else { return }
+        sessions[key]!.finishedUnseen = false
     }
 
     // MARK: - Remote origins

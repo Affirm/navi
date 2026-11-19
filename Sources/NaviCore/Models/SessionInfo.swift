@@ -23,6 +23,9 @@ public struct SessionInfo: Identifiable {
     /// Remote sessions only: true while the host's relay is disconnected. The
     /// session is kept (not pruned) so it reappears in place on reconnect.
     public var isDisconnected: Bool = false
+    /// The turn ended (Stop) and the user hasn't clicked the session since.
+    /// Drives the "finished" highlight; cleared by `acknowledge` or a new turn.
+    public var finishedUnseen: Bool = false
 
     public init(
         id: String,

@@ -40,7 +40,7 @@ private func eventually(_ timeout: TimeInterval = 5, _ condition: () -> Bool) as
     return condition()
 }
 
-private func eventuallyOnMain(_ timeout: TimeInterval = 5, _ condition: @MainActor () -> Bool) async -> Bool {
+func eventuallyOnMain(_ timeout: TimeInterval = 5, _ condition: @MainActor () -> Bool) async -> Bool {
     let deadline = Date().addingTimeInterval(timeout)
     while Date() < deadline {
         if await condition() { return true }
@@ -355,5 +355,28 @@ struct EventMonitorRemoteTests {
 
         monitor.removeOrigin("devbox")
         #expect(await eventuallyOnMain { monitor.sessions[key] == nil && monitor.events.isEmpty })
+    }
+}
+
+@Suite("Finished highlight", .serialized)
+struct FinishedHighlightTests {
+    @Test func stopMarksFinishedUntilAcknowledgedOrNewTurn() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("navi-test-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let monitor = EventMonitor(stateDir: dir.path, watch: false)
+        let key = SessionKey(origin: "devbox", sessionID: "s1")
+        func stop(_ n: Int) {
+            monitor.ingestRemoteEvent(["id": "\(n)-" + String(repeating: "a", count: 32), "type": "stop",
+                                       "session_id": "s1"], origin: "devbox")
+        }
+        stop(1)
+        #expect(await eventuallyOnMain { monitor.sessions[key]?.finishedUnseen == true })
+        await MainActor.run { monitor.acknowledge(key) }
+        #expect(await MainActor.run { monitor.sessions[key]?.finishedUnseen } == false)
+
+        stop(2)
+        #expect(await eventuallyOnMain { monitor.sessions[key]?.finishedUnseen == true })
+        monitor.ingestRemoteWorking(sessionID: "s1", origin: "devbox")
+        #expect(await eventuallyOnMain { monitor.sessions[key]?.finishedUnseen == false })
     }
 }

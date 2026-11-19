@@ -30,6 +30,11 @@ struct SessionSection: View {
     @State private var isExpanded = false
     @AppStorage("NaviFontScale") private var s: Double = 1.0
 
+    /// Finished and not yet clicked: pulse until acknowledged.
+    private var highlightFinished: Bool {
+        floatingManager.highlightFinishedEnabled && group.info.finishedUnseen && !group.hasPending
+    }
+
     private var shouldExpand: Bool {
         group.hasPending || group.events.contains { $0.type == "info" && !$0.resolved }
     }
@@ -39,11 +44,15 @@ struct SessionSection: View {
             // Session header
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 0) {
-                    Button { withAnimation(.easeInOut(duration: 0.2)) { isExpanded.toggle() } } label: {
+                    Button {
+                        monitor.acknowledge(group.info.key)
+                        withAnimation(.easeInOut(duration: 0.2)) { isExpanded.toggle() }
+                    } label: {
                         HStack(spacing: 6) {
                             Image(systemName: group.status.icon)
                                 .foregroundStyle(group.status.color)
                                 .font(.system(size: 13 * s))
+                                .symbolEffect(.pulse, options: .repeating, isActive: highlightFinished)
 
                             Image(systemName: "folder.fill")
                                 .foregroundStyle(.secondary)
@@ -101,7 +110,10 @@ struct SessionSection: View {
                     // Remote sessions run on another machine: their tty/pid
                     // mean nothing here, so never try to focus a local terminal.
                     if group.info.isLocal && (!group.info.tty.isEmpty || group.info.pid > 0) {
-                        Button { focusTerminal(tty: group.info.tty, pid: group.info.pid) } label: {
+                        Button {
+                            monitor.acknowledge(group.info.key)
+                            focusTerminal(tty: group.info.tty, pid: group.info.pid)
+                        } label: {
                             Image(systemName: "terminal.fill")
                                 .font(.system(size: 10 * s, weight: .bold))
                                 .foregroundStyle(.secondary)
@@ -252,6 +264,7 @@ struct SessionSection: View {
             RoundedRectangle(cornerRadius: 7)
                 .stroke(group.hasPending ? Color.orange.opacity(0.2) : Color.gray.opacity(0.2), lineWidth: 0.5)
         )
+        .modifier(FinishedPulse(active: highlightFinished))
         .padding(.horizontal, 6)
         .onAppear {
             if shouldExpand { isExpanded = true }
@@ -363,5 +376,34 @@ struct SessionSection: View {
         .padding(.vertical, 2)
         .opacity(sub.isRunning ? 1 : 0.55)
         .help(sub.description.isEmpty ? sub.agentType : "\(sub.agentType): \(sub.description)")
+    }
+}
+
+/// Breathing green glow on a session card whose turn just ended, shown until
+/// the user clicks the session (see `SessionInfo.finishedUnseen`).
+private struct FinishedPulse: ViewModifier {
+    let active: Bool
+    @State private var bright = false
+
+    func body(content: Content) -> some View {
+        content
+            .background(
+                RoundedRectangle(cornerRadius: 7)
+                    .fill(Color.green.opacity(active ? (bright ? 0.14 : 0.03) : 0))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 7)
+                    .stroke(Color.green.opacity(active ? (bright ? 0.8 : 0.2) : 0), lineWidth: 1.2)
+            )
+            .onAppear { update(active) }
+            .onChange(of: active) { _, on in update(on) }
+    }
+
+    private func update(_ on: Bool) {
+        if on {
+            withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) { bright = true }
+        } else {
+            withAnimation(.easeOut(duration: 0.2)) { bright = false }
+        }
     }
 }
