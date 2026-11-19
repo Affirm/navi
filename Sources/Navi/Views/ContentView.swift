@@ -522,12 +522,90 @@ struct ContentView: View {
         .frame(maxWidth: .infinity, minHeight: 60)
     }
 
+    /// Collapsed host groups, persisted as a newline-separated list of ids.
+    @AppStorage("Navi.CollapsedHosts") private var collapsedHostsRaw: String = ""
+    private var collapsedHosts: Set<String> { Set(collapsedHostsRaw.split(separator: "\n").map(String.init)) }
+    private func toggleCollapsed(_ id: String) {
+        var set = collapsedHosts
+        if set.contains(id) { set.remove(id) } else { set.insert(id) }
+        collapsedHostsRaw = set.sorted().joined(separator: "\n")
+    }
+
     private var sessionList: some View {
-        VStack(spacing: 6) {
-            ForEach(sessionGroups) { group in
-                SessionSection(group: group, monitor: monitor, floatingManager: floatingManager, enrichmentService: enrichmentService)
+        let groups = sessionGroups
+        return VStack(spacing: 6) {
+            if HostGroup.shouldGroup(groups) {
+                // Sessions span remote hosts: one collapsible header per host,
+                // the host with the latest activity on top.
+                ForEach(HostGroup.make(from: groups)) { host in
+                    let collapsed = collapsedHosts.contains(host.id)
+                    HostHeader(host: host, collapsed: collapsed) {
+                        withAnimation(.easeInOut(duration: 0.2)) { toggleCollapsed(host.id) }
+                    }
+                    ForEach(collapsed ? host.collapsedSessions : host.sessions) { group in
+                        SessionSection(group: group, monitor: monitor, floatingManager: floatingManager, enrichmentService: enrichmentService)
+                    }
+                }
+            } else {
+                ForEach(groups) { group in
+                    SessionSection(group: group, monitor: monitor, floatingManager: floatingManager, enrichmentService: enrichmentService)
+                }
             }
         }
         .padding(.vertical, 6)
+    }
+}
+
+/// Header above one host's sessions: name, session count, attention and
+/// connection state. Click to collapse; a collapsed host still shows any
+/// session waiting for a permission decision.
+private struct HostHeader: View {
+    let host: HostGroup
+    let collapsed: Bool
+    let toggle: () -> Void
+    @AppStorage("NaviFontScale") private var s: Double = 1.0
+
+    var body: some View {
+        Button(action: toggle) {
+            HStack(spacing: 6) {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 9 * s, weight: .bold))
+                    .foregroundStyle(.tertiary)
+                    .rotationEffect(.degrees(collapsed ? 0 : 90))
+                Image(systemName: host.isLocal ? "laptopcomputer" : "server.rack")
+                    .font(.system(size: 11 * s))
+                    .foregroundStyle(.secondary)
+                Text(host.title)
+                    .font(.system(size: 12 * s, weight: .semibold))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text("\(host.sessions.count)")
+                    .font(.system(size: 10 * s, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 5)
+                    .background(Capsule().fill(Color.secondary.opacity(0.15)))
+                if host.pendingCount > 0 {
+                    Label("\(host.pendingCount)", systemImage: "exclamationmark.circle.fill")
+                        .font(.system(size: 10 * s, weight: .medium))
+                        .foregroundStyle(.orange)
+                }
+                if host.isDisconnected {
+                    Label("Disconnected", systemImage: "wifi.slash")
+                        .font(.system(size: 10 * s))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                TimelineView(.periodic(from: .now, by: 1)) { context in
+                    Text(relativeTime(from: host.lastActivity, to: context.date))
+                        .font(.system(size: 10 * s))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.top, 4)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(collapsed ? "Show sessions on \(host.title)" : "Hide sessions on \(host.title)")
     }
 }
