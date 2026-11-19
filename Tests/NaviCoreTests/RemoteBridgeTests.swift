@@ -459,6 +459,28 @@ struct DismissalPersistenceTests {
     }
 }
 
+@Suite("Hidden sessions list", .serialized)
+struct HiddenListTests {
+    @Test func unhideRestoresRowAndNameIsPersisted() async throws {
+        let suite = "navi-hidden-\(UUID().uuidString)"
+        let store = try #require(UserDefaults(suiteName: suite))
+        defer { store.removePersistentDomain(forName: suite) }
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("navi-test-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let key = SessionKey(origin: "ops", sessionID: "s1")
+        let monitor = EventMonitor(stateDir: dir.path, watch: false, dismissedStore: store)
+        monitor.applyRemoteHeartbeat(origin: "ops", sessions: [DiscoveredSession(
+            sessionID: "s1", pid: 3, alive: true, claudeStatus: "idle", title: "Fix\tthe build")], live: ["s1"])
+        #expect(await eventuallyOnMain { monitor.sessions[key] != nil })
+        monitor.dismissSession(key)
+        #expect(await eventuallyOnMain { monitor.hiddenSessions.map(\.label) == ["Fix the build"] })
+        #expect(Set(EventMonitor.loadDismissed(from: store).values.map(\.name)) == ["Fix the build"])
+
+        monitor.unhide(key)
+        #expect(await eventuallyOnMain { monitor.sessions[key] != nil && monitor.hiddenSessions.isEmpty })
+    }
+}
+
 @Suite("Hidden sessions wake on updates", .serialized)
 struct DismissWakeTests {
     private let t0 = Date(timeIntervalSince1970: 1_000)

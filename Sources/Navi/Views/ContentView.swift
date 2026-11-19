@@ -158,6 +158,9 @@ struct ContentView: View {
                 .help("Show floating window / bring to front")
             }
             Spacer()
+            if !monitor.hiddenSessions.isEmpty {
+                hiddenSessionsMenu
+            }
             if !sessionGroups.isEmpty {
                 Text("\(sessionGroups.count) session\(sessionGroups.count == 1 ? "" : "s")")
                     .font(.system(size: 11))
@@ -177,6 +180,36 @@ struct ContentView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 4)
+    }
+
+    /// Sessions hidden with ✕: pick one to show it again.
+    private var hiddenSessionsMenu: some View {
+        let hidden = monitor.hiddenSessions
+        let multiHost = Set(hidden.map(\.key.origin)).count > 1 || hidden.contains { !$0.key.isLocal }
+        return Menu {
+            Section("Hidden sessions") {
+                ForEach(hidden) { h in
+                    Button {
+                        monitor.unhide(h.key)
+                    } label: {
+                        Text(multiHost ? "\(h.label) — \(h.hostLabel)" : h.label)
+                    }
+                }
+            }
+            Divider()
+            Button("Show all") { monitor.unhideAll() }
+        } label: {
+            HStack(spacing: 2) {
+                Image(systemName: "eye.slash")
+                Text("\(hidden.count)")
+            }
+            .font(.system(size: 11))
+            .foregroundStyle(.secondary)
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Hidden sessions: choose one to show it again")
     }
 
     @State private var settingsTab = 0

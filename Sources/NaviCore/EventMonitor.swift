@@ -23,7 +23,7 @@ public class EventMonitor: ObservableObject, RemoteEventSink {
     /// and heartbeats skip them; any update (an event, a new turn, a status
     /// change in the registry) brings them back, and the entry is dropped
     /// once the session ends.
-    private(set) var dismissed: [SessionKey: SessionReconciler.Dismissal] = [:] {
+    @Published public private(set) var dismissed: [SessionKey: SessionReconciler.Dismissal] = [:] {
         didSet { if dismissed != oldValue { saveDismissed() } }
     }
     /// Where dismissals persist across restarts (nil = don't persist).
@@ -253,16 +253,19 @@ public class EventMonitor: ObservableObject, RemoteEventSink {
         for entry in raw {
             let parts = entry.split(separator: "\t", maxSplits: 2, omittingEmptySubsequences: false).map(String.init)
             guard parts.count >= 2, RemoteMessage.isValidSessionID(parts[1]) else { continue }
-            let at = parts.count == 3 ? Double(parts[2]).map { Date(timeIntervalSince1970: $0) } : nil
-            out[SessionKey(origin: parts[0], sessionID: parts[1])] = .init(at: at ?? now)
+            let at = parts.count == 3 ? Double(parts[2].prefix { $0 != "\t" }).map { Date(timeIntervalSince1970: $0) } : nil
+            let name = parts.count == 3 ? parts[2].split(separator: "\t", maxSplits: 1).dropFirst().first.map(String.init) ?? "" : ""
+            out[SessionKey(origin: parts[0], sessionID: parts[1])] = .init(at: at ?? now, name: String(name.prefix(200)))
         }
         return out
     }
 
     private func saveDismissed() {
         guard let store = dismissedStore else { return }
-        let raw = dismissed.map { key, d in
-            "\(key.origin)\t\(key.sessionID)\t\(Int(d.at.timeIntervalSince1970))"
+        let raw = dismissed.map { key, d -> String in
+            let name = d.name.components(separatedBy: .newlines).joined(separator: " ")
+                .replacingOccurrences(of: "\t", with: " ")
+            return "\(key.origin)\t\(key.sessionID)\t\(Int(d.at.timeIntervalSince1970))\t\(name)"
         }
         store.set(raw.sorted(), forKey: EventMonitor.dismissedKey)
     }
@@ -577,10 +580,46 @@ public class EventMonitor: ObservableObject, RemoteEventSink {
     /// A dismissal recording the status the session had when hidden, so a
     /// later change in the registry is recognised as an update.
     static func dismissal(of info: SessionInfo?, now: Date = Date()) -> SessionReconciler.Dismissal {
+        guard let info else { return .init(at: now) }
+        let name = info.displayName(useSessionName: true)
+            .split(whereSeparator: \.isWhitespace).joined(separator: " ")
         // No registry status yet (known only from events): let the first
         // sighting set the baseline instead of counting as a change.
-        guard let info, !info.claudeStatus.isEmpty || info.statusUpdatedAt != nil else { return .init(at: now) }
-        return .init(at: now, baseline: .init(status: info.claudeStatus, updatedAt: info.statusUpdatedAt))
+        guard !info.claudeStatus.isEmpty || info.statusUpdatedAt != nil else {
+            return .init(at: now, name: name, snapshot: info)
+        }
+        return .init(at: now, baseline: .init(status: info.claudeStatus, updatedAt: info.statusUpdatedAt),
+                     name: name, snapshot: info)
+    }
+
+    /// Sessions hidden with ✕, most recently hidden first.
+    public var hiddenSessions: [HiddenSession] {
+        dismissed.map { HiddenSession(key: $0.key, name: $0.value.name, hiddenAt: $0.value.at) }
+            .sorted { $0.hiddenAt != $1.hiddenAt ? $0.hiddenAt > $1.hiddenAt : $0.key.id < $1.key.id }
+    }
+
+    /// Show a hidden session again. Its saved row comes back at once when
+    /// known; otherwise the next discovery poll or heartbeat re-adds it.
+    public func unhide(_ key: SessionKey) {
+        DispatchQueue.main.async { [weak self] in self?.applyUnhide([key]) }
+    }
+
+    public func unhideAll() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.applyUnhide(Array(self.dismissed.keys))
+        }
+    }
+
+    private func applyUnhide(_ keys: [SessionKey]) {
+        for key in keys {
+            guard let d = dismissed.removeValue(forKey: key) else { continue }
+            if sessions[key] == nil, var info = d.snapshot {
+                info.finishedUnseen = false
+                sessions[key] = info
+                if info.isLocal { enrichmentService?.refresh(for: info) }
+            }
+        }
     }
 
     public func dismissSession(_ key: SessionKey) {

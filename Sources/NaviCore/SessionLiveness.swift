@@ -133,6 +133,15 @@ public enum SessionReconciler {
         public var at: Date
         /// Status and `updatedAt` last seen while hidden; nil until known.
         public var baseline: Baseline?
+        /// Label for the hidden-sessions list (persisted).
+        public var name: String = ""
+        /// The row as it was when hidden, so unhiding can show it at once
+        /// (in memory only; after a restart discovery brings it back).
+        public var snapshot: SessionInfo?
+
+        public static func == (a: Dismissal, b: Dismissal) -> Bool {
+            a.at == b.at && a.baseline == b.baseline && a.name == b.name
+        }
 
         public struct Baseline: Equatable {
             public var status: String
@@ -143,9 +152,11 @@ public enum SessionReconciler {
             }
         }
 
-        public init(at: Date, baseline: Baseline? = nil) {
+        public init(at: Date, baseline: Baseline? = nil, name: String = "", snapshot: SessionInfo? = nil) {
             self.at = at
             self.baseline = baseline
+            self.name = name
+            self.snapshot = snapshot
         }
     }
 
