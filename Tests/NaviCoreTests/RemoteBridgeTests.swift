@@ -405,3 +405,46 @@ struct DismissPersistenceTests {
         #expect(await MainActor.run { monitor.dismissed.isEmpty })
     }
 }
+
+@Suite("Dismissals persist", .serialized)
+struct DismissalPersistenceTests {
+    @Test func dismissalSurvivesRestartUntilNewActivity() async throws {
+        let suite = "navi-dismiss-\(UUID().uuidString)"
+        let store = try #require(UserDefaults(suiteName: suite))
+        defer { store.removePersistentDomain(forName: suite) }
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("navi-test-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let key = SessionKey(origin: "ops", sessionID: "s1")
+        let beat: (EventMonitor) -> Void = { m in
+            m.applyRemoteHeartbeat(origin: "ops", sessions: [DiscoveredSession(sessionID: "s1", pid: 3, alive: true)], live: ["s1"])
+        }
+
+        let first = EventMonitor(stateDir: dir.path, watch: false, dismissedStore: store)
+        beat(first)
+        #expect(await eventuallyOnMain { first.sessions[key] != nil })
+        first.dismissSession(key)
+        #expect(await eventuallyOnMain { first.sessions[key] == nil })
+        #expect(store.stringArray(forKey: EventMonitor.dismissedKey) == ["ops\ts1"])
+
+        // "Restart": a new monitor with the same store keeps it hidden.
+        let second = EventMonitor(stateDir: dir.path, watch: false, dismissedStore: store)
+        #expect(second.dismissed == [key])
+        beat(second)
+        try await Task.sleep(nanoseconds: 100_000_000)
+        #expect(await MainActor.run { second.sessions[key] } == nil)
+
+        // New activity brings it back and clears the stored entry.
+        second.ingestRemoteWorking(sessionID: "s1", origin: "ops")
+        #expect(await eventuallyOnMain { second.dismissed.isEmpty })
+        #expect(store.stringArray(forKey: EventMonitor.dismissedKey) == [])
+    }
+
+    @Test func malformedStoredEntriesAreIgnored() throws {
+        let suite = "navi-dismiss-\(UUID().uuidString)"
+        let store = try #require(UserDefaults(suiteName: suite))
+        defer { store.removePersistentDomain(forName: suite) }
+        store.set(["ops\tgood-1", "no-tab", "ops\t../bad", "\tlocal_2"], forKey: EventMonitor.dismissedKey)
+        #expect(EventMonitor.loadDismissed(from: store) ==
+                [SessionKey(origin: "ops", sessionID: "good-1"), SessionKey(sessionID: "local_2")])
+    }
+}

@@ -20,7 +20,12 @@ public class EventMonitor: ObservableObject, RemoteEventSink {
     /// Sessions the user dismissed (✕) while they were still alive. Discovery
     /// and heartbeats skip them; new activity (an event or a new turn) brings
     /// them back, and the entry is dropped once the session ends.
-    private(set) var dismissed = Set<SessionKey>()
+    private(set) var dismissed = Set<SessionKey>() {
+        didSet { if dismissed != oldValue { saveDismissed() } }
+    }
+    /// Where dismissals persist across restarts (nil = don't persist).
+    private let dismissedStore: UserDefaults?
+    static let dismissedKey = "Navi.DismissedSessions"
     public weak var enrichmentService: (any SessionEnrichmentProvider)?
     /// Delivers approve/deny for permission cards from remote origins.
     public weak var remoteResponder: (any RemoteResponder)?
@@ -35,15 +40,19 @@ public class EventMonitor: ObservableObject, RemoteEventSink {
     }
 
     public convenience init() {
-        self.init(stateDir: "/tmp/navi", watch: true)
+        self.init(stateDir: "/tmp/navi", watch: true, dismissedStore: .standard)
     }
 
     /// `watch: false` (tests) skips cleanup, session discovery and the
     /// directory watchers, so an instance never touches the live /tmp/navi.
-    init(stateDir: String, watch: Bool) {
+    init(stateDir: String, watch: Bool, dismissedStore: UserDefaults? = nil) {
         self.stateDir = stateDir
         self.eventsDir = "\(stateDir)/events"
         self.responsesDir = "\(stateDir)/responses"
+        self.dismissedStore = dismissedStore
+        // Sessions hidden with ✕ stay hidden after a restart until they do
+        // something new (or end, which drops the entry on the first poll).
+        self.dismissed = EventMonitor.loadDismissed(from: dismissedStore)
         guard watch else { return }
         let fm = FileManager.default
         let ownerOnly: [FileAttributeKey: Any] = [.posixPermissions: 0o700]
@@ -223,6 +232,21 @@ public class EventMonitor: ObservableObject, RemoteEventSink {
             if let info = sessions[key] { enrichmentService?.refresh(for: info) }
         }
         return Set(discovered.filter(\.alive).map(\.sessionID))
+    }
+
+    /// Stored as "origin\tsessionID" strings ("" origin = this Mac).
+    static func loadDismissed(from store: UserDefaults?) -> Set<SessionKey> {
+        let raw = store?.stringArray(forKey: dismissedKey) ?? []
+        return Set(raw.compactMap { entry in
+            let parts = entry.split(separator: "\t", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
+            guard parts.count == 2, RemoteMessage.isValidSessionID(parts[1]) else { return nil }
+            return SessionKey(origin: parts[0], sessionID: parts[1])
+        })
+    }
+
+    private func saveDismissed() {
+        guard let store = dismissedStore else { return }
+        store.set(dismissed.map { "\($0.origin)\t\($0.sessionID)" }.sorted(), forKey: EventMonitor.dismissedKey)
     }
 
     /// Look up a local process's controlling TTY so terminal focus works
