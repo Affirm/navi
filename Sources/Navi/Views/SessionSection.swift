@@ -63,7 +63,8 @@ struct SessionSection: View {
                                 .font(.system(size: 13 * s, weight: .semibold))
                                 .lineLimit(1)
                                 .truncationMode(.tail)
-                                .help("Session \(group.info.id)")
+                                // Full name (rows truncate long ones) plus the session ID.
+                                .help("\(group.info.displayName(useSessionName: floatingManager.sessionNamesEnabled))\nSession \(group.info.id)")
 
                             Spacer()
 
