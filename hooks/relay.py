@@ -50,6 +50,9 @@ DECISIONS = ("approve", "deny")
 MAX_EVENT_BYTES = 1024 * 1024
 STALE_EVENT_SECONDS = 120
 POLL_SECONDS = 0.3
+TITLE_MAX = 120
+TITLE_TAIL_BYTES = 4 * 1024 * 1024   # first read of a big transcript: tail only
+TITLE_READ_BYTES = 8 * 1024 * 1024   # max bytes read per heartbeat per transcript
 HEARTBEAT_SECONDS = 3.0
 
 _out_lock = threading.Lock()
@@ -131,7 +134,123 @@ def looks_like_claude(pid):
     return b"claude" in cmdline
 
 
-def scan_sessions(sessions_dir, is_claude=looks_like_claude):
+def _clean_title(text):
+    text = " ".join(text.split())
+    return text[:TITLE_MAX]
+
+
+def _first_prompt(d):
+    """Text of a real user prompt line, or "" (tool results, meta, commands)."""
+    if d.get("type") != "user" or d.get("isMeta") or d.get("isSidechain"):
+        return ""
+    msg = d.get("message")
+    content = msg.get("content") if isinstance(msg, dict) else None
+    if isinstance(content, list):
+        content = " ".join(x.get("text", "") for x in content
+                           if isinstance(x, dict) and x.get("type") == "text"
+                           and isinstance(x.get("text"), str))
+    if not isinstance(content, str):
+        return ""
+    content = _clean_title(content)
+    if not content or content.startswith("<"):
+        return ""
+    return content
+
+
+class TitleCache:
+    """Conversation titles from transcripts in ~/.claude/projects/.
+
+    Claude Code appends {"type":"custom-title","customTitle":...} (/rename)
+    and {"type":"ai-title","aiTitle":...} lines as titles change; the latest
+    of each wins, custom over ai, with the first user prompt as a fallback.
+    Transcripts are read incrementally (only new bytes per heartbeat), and
+    only titles leave the server, never conversation content beyond that.
+    """
+
+    def __init__(self, projects_dir):
+        self.projects_dir = projects_dir
+        self.state = {}
+
+    def title(self, sid, cwd):
+        st = self.state.get(sid)
+        if st is None or not os.path.isfile(st["path"]):
+            path = self._find(sid, cwd)
+            if path is None:
+                return ""
+            st = {"path": path, "offset": 0, "custom": "", "ai": "", "first": "",
+                  "partial": b"", "skip_line": False}
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                return ""
+            if size > TITLE_TAIL_BYTES:
+                st["offset"] = size - TITLE_TAIL_BYTES
+                st["skip_line"] = True  # probably starts mid-line
+            self.state[sid] = st
+        try:
+            self._read_new(st)
+        except OSError:
+            pass
+        return st["custom"] or st["ai"] or st["first"]
+
+    def forget_except(self, live_sids):
+        for sid in list(self.state):
+            if sid not in live_sids:
+                del self.state[sid]
+
+    def _find(self, sid, cwd):
+        name = sid + ".jsonl"
+        if cwd:
+            direct = os.path.join(self.projects_dir, re.sub(r"[/.]", "-", cwd), name)
+            if os.path.isfile(direct):
+                return direct
+        try:
+            dirs = os.listdir(self.projects_dir)
+        except OSError:
+            return None
+        for d in dirs:
+            p = os.path.join(self.projects_dir, d, name)
+            if os.path.isfile(p):
+                return p
+        return None
+
+    def _read_new(self, st):
+        size = os.path.getsize(st["path"])
+        if size < st["offset"]:  # truncated/rewritten: start over
+            st.update(offset=0, custom="", ai="", first="", partial=b"", skip_line=False)
+        if size == st["offset"]:
+            return
+        with open(st["path"], "rb") as f:
+            f.seek(st["offset"])
+            data = f.read(min(size - st["offset"], TITLE_READ_BYTES))
+        st["offset"] += len(data)
+        lines = (st["partial"] + data).split(b"\n")
+        st["partial"] = lines.pop()
+        if len(st["partial"]) > TITLE_READ_BYTES:
+            st["partial"] = b""
+        if st["skip_line"] and lines:
+            lines = lines[1:]
+            st["skip_line"] = False
+        for line in lines:
+            want_first = not st["first"] and b'"user"' in line
+            if b'"custom-title"' not in line and b'"ai-title"' not in line and not want_first:
+                continue
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(d, dict):
+                continue
+            t = d.get("type")
+            if t == "custom-title" and isinstance(d.get("customTitle"), str):
+                st["custom"] = _clean_title(d["customTitle"])
+            elif t == "ai-title" and isinstance(d.get("aiTitle"), str):
+                st["ai"] = _clean_title(d["aiTitle"])
+            elif want_first:
+                st["first"] = _first_prompt(d)
+
+
+def scan_sessions(sessions_dir, is_claude=looks_like_claude, titles=None):
     """Live Claude sessions from ~/.claude/sessions/*.json (pid must be running)."""
     live = []
     try:
@@ -168,7 +287,13 @@ def scan_sessions(sessions_dir, is_claude=looks_like_claude):
                 entry[key] = d[key]
         if isinstance(d.get("updatedAt"), (int, float)):
             entry["updatedAt"] = d["updatedAt"]
+        if titles is not None:
+            title = titles.title(sid, entry.get("cwd", ""))
+            if title:
+                entry["title"] = title
         live.append(entry)
+    if titles is not None:
+        titles.forget_except({e["sessionId"] for e in live})
     return live
 
 
@@ -253,6 +378,7 @@ def main(argv):
     parser.add_argument("--root", default="/tmp/navi",
                         help="Navi state dir (tests only; hooks always use /tmp/navi)")
     parser.add_argument("--sessions-dir", default=os.path.expanduser("~/.claude/sessions"))
+    parser.add_argument("--projects-dir", default=os.path.expanduser("~/.claude/projects"))
     parser.add_argument("--features", default="",
                         help="comma-separated feature flags to mirror (see MIRRORABLE_FEATURES)")
     parser.add_argument("--heartbeat", type=float, default=HEARTBEAT_SECONDS)
@@ -288,6 +414,7 @@ def main(argv):
     reader.daemon = True
     reader.start()
 
+    titles = TitleCache(args.projects_dir)
     next_beat = 0.0
     try:
         while not stop.is_set():
@@ -299,7 +426,7 @@ def main(argv):
                     atomic_write(root, "relay.alive", str(int(now)))
                 except OSError:
                     pass
-                sessions = scan_sessions(args.sessions_dir)
+                sessions = scan_sessions(args.sessions_dir, titles=titles)
                 beat = {"kind": "heartbeat", "user": user, "host": host}
                 if sessions is not None:
                     beat["live"] = [s["sessionId"] for s in sessions]

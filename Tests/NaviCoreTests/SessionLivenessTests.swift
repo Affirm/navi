@@ -209,3 +209,36 @@ struct DismissedSessionTests {
         #expect(SessionReconciler.pruneDismissed([a], liveness: ["devbox": .disconnected]) == [a])
     }
 }
+
+@Suite("Session titles")
+struct SessionTitleTests {
+    @Test func heartbeatTitleParsedAndMergedAndShown() {
+        let d = DiscoveredSession.parse(["sessionId": "s", "pid": 1, "cwd": "/w/myapp-1d", "title": "Fix login"],
+                                        isAlive: { _ in true })
+        #expect(d?.title == "Fix login")
+        var t: [SessionKey: SessionInfo] = [:]
+        SessionReconciler.merge([d!], origin: "ops", into: &t)
+        let key = SessionKey(origin: "ops", sessionID: "s")
+        #expect(t[key]?.displayName(useSessionName: true) == "Fix login")
+        #expect(t[key]?.displayName(useSessionName: false) == "myapp-1d")
+
+        // Title updates on later heartbeats; an empty title doesn't erase it.
+        SessionReconciler.merge([DiscoveredSession(sessionID: "s", pid: 1, alive: true, title: "Auth work")],
+                                origin: "ops", into: &t)
+        #expect(t[key]?.title == "Auth work")
+        SessionReconciler.merge([DiscoveredSession(sessionID: "s", pid: 1, alive: true)], origin: "ops", into: &t)
+        #expect(t[key]?.title == "Auth work")
+
+        // An explicit session name still wins over the title.
+        t[key]!.sessionName = "Renamed"
+        #expect(t[key]?.displayName(useSessionName: true) == "Renamed")
+    }
+
+    @Test func remoteMessageHeartbeatKeepsTitle() {
+        let line = #"{"kind":"heartbeat","live":["s"],"sessions":[{"sessionId":"s","pid":2,"title":"Hello"}]}"#
+        guard case let .heartbeat(_, sessions, _, _)? = RemoteMessage.parse(Data(line.utf8)) else {
+            Issue.record("not a heartbeat"); return
+        }
+        #expect(sessions.first?.title == "Hello")
+    }
+}

@@ -26,6 +26,9 @@ public struct SessionInfo: Identifiable {
     /// The turn ended (Stop) and the user hasn't clicked the session since.
     /// Drives the "finished" highlight; cleared by `acknowledge` or a new turn.
     public var finishedUnseen: Bool = false
+    /// Conversation title (custom or AI-generated) read from the transcript.
+    /// Remote sessions only; shown when there's no session name.
+    public var title: String = ""
 
     public init(
         id: String,
@@ -40,7 +43,8 @@ public struct SessionInfo: Identifiable {
         claudeStatus: String = "",
         statusUpdatedAt: Date? = nil,
         origin: String = "",
-        isDisconnected: Bool = false
+        isDisconnected: Bool = false,
+        title: String = ""
     ) {
         self.id = id
         self.projectName = projectName
@@ -55,6 +59,7 @@ public struct SessionInfo: Identifiable {
         self.statusUpdatedAt = statusUpdatedAt
         self.origin = origin
         self.isDisconnected = isDisconnected
+        self.title = title
     }
 
     public var key: SessionKey { SessionKey(origin: origin, sessionID: id) }
@@ -62,12 +67,16 @@ public struct SessionInfo: Identifiable {
     /// True for sessions running on this Mac.
     public var isLocal: Bool { origin.isEmpty }
 
-    /// Display label: session name (if `useSessionName` and set), otherwise project folder name.
+    /// Display label: session name, then conversation title (both only if `useSessionName`
+    /// and set), otherwise project folder name.
     /// `useSessionName` is supplied by the caller rather than read from UserDefaults so
     /// SessionInfo stays a pure value type with no global-state dependency.
     public func displayName(useSessionName: Bool) -> String {
         if useSessionName, !sessionName.isEmpty {
             return sessionName
+        }
+        if useSessionName, !title.isEmpty {
+            return title
         }
         return projectName
     }

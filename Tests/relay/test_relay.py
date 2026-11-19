@@ -166,6 +166,54 @@ class RelayTests(unittest.TestCase):
         live = relay.scan_sessions(self.sessions, is_claude=lambda pid: True)
         self.assertEqual([s["sessionId"] for s in live], ["ghost"])
 
+    def _relay_module(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("navi_relay_titles", RELAY)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_titles_from_transcript(self):
+        relay = self._relay_module()
+        projects = os.path.join(self.tmp.name, "projects")
+        tdir = os.path.join(projects, "-home-me-proj")
+        os.makedirs(tdir)
+        path = os.path.join(tdir, "s1.jsonl")
+        lines = [
+            {"type": "user", "message": {"content": "<command-name>/clear</command-name>"}},
+            {"type": "user", "message": {"content": [{"type": "tool_result", "content": "x"}]}},
+            {"type": "user", "message": {"content": "  Fix the   login bug\nplease "}},
+        ]
+        with open(path, "w") as f:
+            f.write("\n".join(json.dumps(l) for l in lines) + "\n")
+        tc = relay.TitleCache(projects)
+        self.assertEqual(tc.title("s1", "/home/me/proj"), "Fix the login bug please")
+
+        with open(path, "a") as f:  # AI title arrives later; incremental read
+            f.write(json.dumps({"type": "ai-title", "aiTitle": "Login bug fix"}) + "\n")
+        self.assertEqual(tc.title("s1", "/home/me/proj"), "Login bug fix")
+
+        with open(path, "a") as f:  # /rename wins over the AI title, even if older AI titles follow
+            f.write(json.dumps({"type": "custom-title", "customTitle": "Auth work"}) + "\n")
+            f.write(json.dumps({"type": "ai-title", "aiTitle": "Newer AI"}) + "\n")
+            f.write('{"type": "custom-title", "customTi')  # half-written line
+        self.assertEqual(tc.title("s1", "/home/me/proj"), "Auth work")
+        with open(path, "a") as f:
+            f.write('tle": "Auth v2"}\n')
+        self.assertEqual(tc.title("s1", "/elsewhere"), "Auth v2")  # found by scanning dirs too
+
+    def test_heartbeat_carries_title(self):
+        relay = self._relay_module()
+        projects = os.path.join(self.tmp.name, "projects")
+        os.makedirs(os.path.join(projects, "x"))
+        with open(os.path.join(projects, "x", "s9.jsonl"), "w") as f:
+            f.write(json.dumps({"type": "ai-title", "aiTitle": "T" * 500}) + "\n")
+        with open(os.path.join(self.sessions, "1.json"), "w") as f:
+            json.dump({"sessionId": "s9", "pid": os.getpid()}, f)
+        live = relay.scan_sessions(self.sessions, is_claude=lambda p: True,
+                                   titles=relay.TitleCache(projects))
+        self.assertEqual(live[0]["title"], "T" * relay.TITLE_MAX)
+
     def test_missing_sessions_dir_means_no_sessions(self):
         os.rmdir(self.sessions)
         r = self.start()

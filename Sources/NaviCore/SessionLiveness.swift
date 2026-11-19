@@ -23,9 +23,12 @@ public struct DiscoveredSession: Equatable {
     public let name: String
     public let claudeStatus: String
     public let statusUpdatedAt: Date?
+    /// Conversation title from the transcript (remote heartbeats only).
+    public let title: String
 
     public init(sessionID: String, pid: pid_t?, alive: Bool, cwd: String = "",
-                name: String = "", claudeStatus: String = "", statusUpdatedAt: Date? = nil) {
+                name: String = "", claudeStatus: String = "", statusUpdatedAt: Date? = nil,
+                title: String = "") {
         self.sessionID = sessionID
         self.pid = pid
         self.alive = alive
@@ -33,6 +36,7 @@ public struct DiscoveredSession: Equatable {
         self.name = name
         self.claudeStatus = claudeStatus
         self.statusUpdatedAt = statusUpdatedAt
+        self.title = String(title.prefix(200))
     }
 
     /// Parse a session registry dict (`sessionId`, `pid`, `cwd`, `name`,
@@ -48,7 +52,8 @@ public struct DiscoveredSession: Equatable {
             cwd: dict["cwd"] as? String ?? "",
             name: dict["name"] as? String ?? "",
             claudeStatus: dict["status"] as? String ?? "",
-            statusUpdatedAt: parseUpdatedAt(dict["updatedAt"])
+            statusUpdatedAt: parseUpdatedAt(dict["updatedAt"]),
+            title: dict["title"] as? String ?? ""
         )
     }
 
@@ -92,6 +97,8 @@ public enum SessionReconciler {
             if sessions[key] != nil {
                 sessions[key]!.claudeStatus = d.claudeStatus
                 sessions[key]!.statusUpdatedAt = d.statusUpdatedAt
+                // Titles evolve (AI title arrives after the first exchange, /rename).
+                if !d.title.isEmpty { sessions[key]!.title = d.title }
                 if d.alive, let pid = d.pid, sessions[key]!.pid != pid {
                     sessions[key]!.pid = pid
                 }
@@ -109,7 +116,8 @@ public enum SessionReconciler {
                 lastActivity: now,
                 claudeStatus: d.claudeStatus,
                 statusUpdatedAt: d.statusUpdatedAt,
-                origin: origin
+                origin: origin,
+                title: d.title
             )
             added.append(key)
         }
