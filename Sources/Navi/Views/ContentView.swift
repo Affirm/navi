@@ -39,12 +39,12 @@ struct ContentView: View {
     ]
 
     private var sessionGroups: [SessionGroup] {
-        let eventsBySession = Dictionary(grouping: monitor.events) { $0.sessionID }
+        let eventsBySession = Dictionary(grouping: monitor.events) { $0.sessionKey }
         return monitor.sessions.values.map { info in
             SessionGroup(
-                id: info.id,
+                id: info.key.id,
                 info: info,
-                events: eventsBySession[info.id] ?? []
+                events: eventsBySession[info.key] ?? []
             )
         }
         .sorted { a, b in

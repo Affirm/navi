@@ -38,7 +38,7 @@ Run unit tests with `swift test`. Tests live in `Tests/NaviCoreTests/` and exerc
 | Path | Purpose |
 |------|---------|
 | `Package.swift` | SPM manifest: `NaviCore` library, `Navi` executable, `NaviCoreTests` test target |
-| `Sources/NaviCore/` | Library: models (`NaviEvent`, `SessionInfo`, `SessionGroup`, `SessionStatus`, `GitInfo`, `TranscriptInfo`, `PRInfo`, `SubagentInfo`), `EventMonitor`, `FeatureFlags`, helpers (`relativeTime`, `focusTerminal`, `naviLog`), `naviCurrentVersion`, `SessionEnrichmentProvider` protocol |
+| `Sources/NaviCore/` | Library: models (`NaviEvent`, `SessionInfo`, `SessionGroup`, `SessionStatus`, `GitInfo`, `TranscriptInfo`, `PRInfo`, `SubagentInfo`), `SessionKey`, `EventMonitor`, `SessionLiveness` (`OriginLiveness`, `DiscoveredSession`, `SessionReconciler`), `FeatureFlags`, helpers (`relativeTime`, `focusTerminal`, `naviLog`), `naviCurrentVersion`, `SessionEnrichmentProvider` protocol |
 | `Sources/Navi/` | Executable: `@main` + `NaviAppDelegate`, `FloatingWindowManager`, `MenuBarManager`, `EnrichmentService` (conforms to `SessionEnrichmentProvider`), pastel palette, SwiftUI views (`ContentView`, `SessionSection`, `EventRow`, `WindowAccessor`, `FlowLayout`) |
 | `Tests/NaviCoreTests/` | Swift Testing suites for `NaviCore` |
 | `hooks/hooks.json` | Registers Claude Code hooks (loaded at session start) |
@@ -60,6 +60,18 @@ and needs to call into the service on session updates / evictions, so
 `EnrichmentService` conforms to. Add new methods to the protocol if
 `EventMonitor` needs to talk to the service in new ways; views in `Navi`
 read concrete service state (`gitInfoByCwd`, etc.) directly.
+
+### Session origins and liveness
+
+Every `NaviEvent` and `SessionInfo` carries an `origin`: `""` for this Mac, an
+SSH host alias for a remote host. Session IDs are never prefixed; sessions are
+keyed by `SessionKey(origin, sessionID)` and events match sessions by that key.
+Pruning is per origin via `SessionReconciler.prune` and an `OriginLiveness`
+per origin: the local PID scan of `~/.claude/sessions/` yields `.live(ids)` (or
+`.unknown` if the directory can't be read, which skips pruning); a remote host
+reports `.live(ids)` from its relay heartbeat, or `.disconnected`, which keeps
+its sessions and flags them instead of pruning. Enrichment (git, transcripts,
+PRs) and terminal focus only ever run for local sessions.
 
 ### Event Flow
 

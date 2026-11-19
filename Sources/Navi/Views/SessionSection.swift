@@ -81,7 +81,9 @@ struct SessionSection: View {
                     }
                     .buttonStyle(.plain)
 
-                    if !group.info.tty.isEmpty || group.info.pid > 0 {
+                    // Remote sessions run on another machine: their tty/pid
+                    // mean nothing here, so never try to focus a local terminal.
+                    if group.info.isLocal && (!group.info.tty.isEmpty || group.info.pid > 0) {
                         Button { focusTerminal(tty: group.info.tty, pid: group.info.pid) } label: {
                             Image(systemName: "terminal.fill")
                                 .font(.system(size: 10 * s, weight: .bold))
@@ -92,7 +94,7 @@ struct SessionSection: View {
                         .padding(.trailing, 6)
                     }
 
-                    Button { monitor.dismissSession(group.id) } label: {
+                    Button { monitor.dismissSession(group.info.key) } label: {
                         Image(systemName: "xmark")
                             .font(.system(size: 10 * s, weight: .bold))
                             .foregroundStyle(.tertiary)
