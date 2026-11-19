@@ -106,6 +106,9 @@ struct SessionSection: View {
                         }
                         .padding(.horizontal, 10)
                         .padding(.vertical, 6)
+                        // Whole row is clickable, not just the text and icons
+                        // (a plain button only hit-tests drawn content).
+                        .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                     // Double-click: open the conversation where it runs (Claude
