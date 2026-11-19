@@ -1,0 +1,305 @@
+"""Navi relay: runs on a remote host, speaks JSON lines over stdio.
+
+Navi (on the Mac) starts this over SSH, passing the source as an argument so
+nothing has to be installed on the server and the relay always matches the
+app version:
+
+    ssh -T -o BatchMode=yes <alias> \\
+        python3 -c 'import base64;exec(base64.b64decode("<b64 source>"))' [args]
+
+stdout (relay -> Navi), one JSON object per line:
+    {"kind":"hello","version":N,"user":...,"host":...}
+    {"kind":"event","event":{...}}          regular event file contents
+    {"kind":"resolve","resolve":{...}}      resolve-/cancel- signal
+    {"kind":"working","session_id":"..."}   UserPromptSubmit signal
+    {"kind":"heartbeat","live":[ids],"sessions":[...],"user":...,"host":...}
+    {"kind":"error","message":"..."}        fatal; the relay exits after it
+
+stdin (Navi -> relay), one JSON object per line:
+    {"kind":"response","id":"<epoch>-<32 hex>","decision":"approve|deny"}
+
+The relay exits cleanly on stdin EOF (i.e. when the SSH connection or Navi
+goes away). It never listens on a network port: the responses/ directory is
+trusted unconditionally by hook.sh, so SSH stdio is the only transport.
+
+Stdlib only; works with Python 3.6+.
+"""
+
+import argparse
+import getpass
+import json
+import os
+import re
+import signal
+import socket
+import stat
+import sys
+import tempfile
+import threading
+import time
+
+RELAY_VERSION = 1
+
+# Feature flags the relay may mirror onto the server. Only flags that change
+# what the headless hooks write are relevant; terminal-focus is meaningless on
+# a remote host and is never mirrored.
+MIRRORABLE_FEATURES = ("auto-dismiss", "session-status", "session-names")
+
+EVENT_ID_RE = re.compile(r"^[0-9]{1,20}-[0-9a-f]{32}$")
+DECISIONS = ("approve", "deny")
+MAX_EVENT_BYTES = 1024 * 1024
+STALE_EVENT_SECONDS = 120
+POLL_SECONDS = 0.3
+HEARTBEAT_SECONDS = 3.0
+
+_out_lock = threading.Lock()
+
+
+def emit(obj):
+    """Write one JSON line to stdout. Returns False if Navi is gone."""
+    line = json.dumps(obj, separators=(",", ":")) + "\n"
+    with _out_lock:
+        try:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            return True
+        except (BrokenPipeError, OSError, ValueError):
+            return False
+
+
+def fail(message, code=2):
+    emit({"kind": "error", "message": message})
+    sys.exit(code)
+
+
+def ensure_private_dir(path):
+    """Create path as 0700 if missing; refuse a symlink or a dir owned by
+    someone else (/tmp is shared on multi-user servers)."""
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
+    st = os.lstat(path)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        fail("{} is not a directory (symlink?); refusing to use it".format(path))
+    if st.st_uid != os.getuid():
+        fail("{} is owned by another user; refusing to use it".format(path))
+    if stat.S_IMODE(st.st_mode) != 0o700:
+        os.chmod(path, 0o700)
+
+
+def atomic_write(directory, name, data):
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix="." + name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(data)
+        os.rename(tmp, os.path.join(directory, name))
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def sync_features(features_dir, enabled):
+    for name in MIRRORABLE_FEATURES:
+        path = os.path.join(features_dir, name)
+        if name in enabled:
+            if not os.path.exists(path):
+                open(path, "a").close()
+        else:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+
+
+def scan_sessions(sessions_dir):
+    """Live Claude sessions from ~/.claude/sessions/*.json (pid must be running)."""
+    live = []
+    try:
+        names = os.listdir(sessions_dir)
+    except FileNotFoundError:
+        return live  # Claude Code hasn't run here yet: no sessions
+    except OSError:
+        return None  # unknown; Navi skips pruning rather than wiping
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(sessions_dir, name)) as f:
+                d = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(d, dict):
+            continue
+        sid = d.get("sessionId")
+        pid = d.get("pid")
+        if not isinstance(sid, str) or not sid or not isinstance(pid, int) or pid <= 0:
+            continue
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            pass  # exists, owned by someone else
+        entry = {"sessionId": sid, "pid": pid}
+        for key in ("cwd", "name", "status"):
+            if isinstance(d.get(key), str):
+                entry[key] = d[key]
+        if isinstance(d.get("updatedAt"), (int, float)):
+            entry["updatedAt"] = d["updatedAt"]
+        live.append(entry)
+    return live
+
+
+def forward_events(events_dir):
+    """Emit every complete event file, then delete it. Returns False if Navi
+    is gone."""
+    try:
+        names = sorted(os.listdir(events_dir))
+    except OSError:
+        return True
+    now = time.time()
+    for name in names:
+        if name.startswith(".") or not name.endswith(".json"):
+            continue
+        path = os.path.join(events_dir, name)
+        try:
+            st = os.lstat(path)
+            if not stat.S_ISREG(st.st_mode):
+                os.unlink(path)
+                continue
+            if now - st.st_mtime > STALE_EVENT_SECONDS or st.st_size > MAX_EVENT_BYTES:
+                os.unlink(path)
+                continue
+            with open(path) as f:
+                d = json.load(f)
+        except (OSError, ValueError):
+            # Unreadable or half-written by a non-atomic producer: drop it so
+            # it doesn't wedge the loop. Hooks always write atomically.
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            continue
+        if not isinstance(d, dict):
+            os.unlink(path)
+            continue
+        if name.startswith("resolve-") or name.startswith("cancel-"):
+            msg = {"kind": "resolve", "resolve": d}
+        elif name.startswith("working-"):
+            sid = d.get("session_id")
+            msg = {"kind": "working", "session_id": sid} if isinstance(sid, str) else None
+        else:
+            msg = {"kind": "event", "event": d}
+        if msg is not None and not emit(msg):
+            return False  # leave the file for the next relay
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    return True
+
+
+def handle_command(line, responses_dir):
+    try:
+        msg = json.loads(line)
+    except ValueError:
+        return
+    if not isinstance(msg, dict) or msg.get("kind") != "response":
+        return
+    eid = msg.get("id")
+    decision = msg.get("decision")
+    if not isinstance(eid, str) or not EVENT_ID_RE.match(eid) or decision not in DECISIONS:
+        return
+    atomic_write(responses_dir, eid, decision)
+
+
+def read_stdin(responses_dir, stop):
+    try:
+        for line in sys.stdin:
+            line = line.strip()
+            if line:
+                try:
+                    handle_command(line, responses_dir)
+                except OSError:
+                    pass
+    finally:
+        stop.set()
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(prog="navi-relay")
+    parser.add_argument("--root", default="/tmp/navi",
+                        help="Navi state dir (tests only; hooks always use /tmp/navi)")
+    parser.add_argument("--sessions-dir", default=os.path.expanduser("~/.claude/sessions"))
+    parser.add_argument("--features", default="",
+                        help="comma-separated feature flags to mirror (see MIRRORABLE_FEATURES)")
+    parser.add_argument("--heartbeat", type=float, default=HEARTBEAT_SECONDS)
+    args = parser.parse_args(argv)
+
+    root = args.root
+    events_dir = os.path.join(root, "events")
+    responses_dir = os.path.join(root, "responses")
+    features_dir = os.path.join(root, "features")
+    alive_file = os.path.join(root, "relay.alive")
+
+    ensure_private_dir(root)
+    for d in (events_dir, responses_dir, features_dir):
+        ensure_private_dir(d)
+
+    enabled = {f for f in args.features.split(",") if f in MIRRORABLE_FEATURES}
+    sync_features(features_dir, enabled)
+
+    user = getpass.getuser()
+    host = socket.gethostname()
+    if not emit({"kind": "hello", "version": RELAY_VERSION, "user": user, "host": host}):
+        return 0
+
+    stop = threading.Event()
+
+    def on_signal(signum, frame):
+        stop.set()
+
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, on_signal)
+
+    reader = threading.Thread(target=read_stdin, args=(responses_dir, stop))
+    reader.daemon = True
+    reader.start()
+
+    next_beat = 0.0
+    try:
+        while not stop.is_set():
+            now = time.time()
+            if now >= next_beat:
+                next_beat = now + args.heartbeat
+                # Tell hook.sh a relay is attached (it checks freshness).
+                try:
+                    atomic_write(root, "relay.alive", str(int(now)))
+                except OSError:
+                    pass
+                sessions = scan_sessions(args.sessions_dir)
+                beat = {"kind": "heartbeat", "user": user, "host": host}
+                if sessions is not None:
+                    beat["live"] = [s["sessionId"] for s in sessions]
+                    beat["sessions"] = sessions
+                if not emit(beat):
+                    break
+            if not forward_events(events_dir):
+                break
+            stop.wait(POLL_SECONDS)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            os.unlink(alive_file)
+        except OSError:
+            pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

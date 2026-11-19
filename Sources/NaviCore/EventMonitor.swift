@@ -2,14 +2,15 @@ import Foundation
 import Combine
 import AppKit
 
-public class EventMonitor: ObservableObject {
+public class EventMonitor: ObservableObject, RemoteEventSink {
     @Published public var events: [NaviEvent] = []
     /// Sessions keyed by (origin, sessionID). See `SessionKey`.
     @Published public var sessions: [SessionKey: SessionInfo] = [:]
     @Published public var needsBinaryRestart = false
 
-    private let eventsDir = "/tmp/navi/events"
-    private let responsesDir = "/tmp/navi/responses"
+    private let stateDir: String
+    private let eventsDir: String
+    private let responsesDir: String
     private var knownIDs = Set<String>()
     private var timer: Timer?
     private var dirSource: DispatchSourceFileSystemObject?
@@ -17,6 +18,10 @@ public class EventMonitor: ObservableObject {
     /// origin's liveness is recomputed from the PID scan on every poll.
     private var remoteLiveness: [String: OriginLiveness] = [:]
     public weak var enrichmentService: (any SessionEnrichmentProvider)?
+    /// Delivers approve/deny for permission cards from remote origins.
+    public weak var remoteResponder: (any RemoteResponder)?
+    /// Event IDs already ingested from remote origins ("origin/id").
+    private var knownRemoteIDs = Set<String>()
 
     public func attach(enrichmentService: any SessionEnrichmentProvider) {
         self.enrichmentService = enrichmentService
@@ -25,7 +30,17 @@ public class EventMonitor: ObservableObject {
         }
     }
 
-    public init() {
+    public convenience init() {
+        self.init(stateDir: "/tmp/navi", watch: true)
+    }
+
+    /// `watch: false` (tests) skips cleanup, session discovery and the
+    /// directory watchers, so an instance never touches the live /tmp/navi.
+    init(stateDir: String, watch: Bool) {
+        self.stateDir = stateDir
+        self.eventsDir = "\(stateDir)/events"
+        self.responsesDir = "\(stateDir)/responses"
+        guard watch else { return }
         let fm = FileManager.default
         let ownerOnly: [FileAttributeKey: Any] = [.posixPermissions: 0o700]
         try? fm.createDirectory(atPath: eventsDir, withIntermediateDirectories: true, attributes: ownerOnly)
@@ -33,13 +48,13 @@ public class EventMonitor: ObservableObject {
         // Self-heal perms on pre-existing dirs so event JSON (Confidential tool
         // input) and response files (trusted permission-decision channel) stay
         // owner-readable only.
-        try? fm.setAttributes(ownerOnly, ofItemAtPath: "/tmp/navi")
+        try? fm.setAttributes(ownerOnly, ofItemAtPath: stateDir)
         try? fm.setAttributes(ownerOnly, ofItemAtPath: eventsDir)
         try? fm.setAttributes(ownerOnly, ofItemAtPath: responsesDir)
         // Clean stale files from previous runs
         cleanDirectory(eventsDir)
         cleanDirectory(responsesDir)
-        try? fm.removeItem(atPath: "/tmp/navi/needs-restart")
+        try? fm.removeItem(atPath: "\(stateDir)/needs-restart")
 
         // Discover already-running Claude sessions from ~/.claude/sessions/
         discoverSessions()
@@ -154,7 +169,7 @@ public class EventMonitor: ObservableObject {
             self.reconcile(liveness: liveness)
 
             // Check if build.sh rebuilt a newer version while we're running
-            let restartMarker = "/tmp/navi/needs-restart"
+            let restartMarker = "\(self.stateDir)/needs-restart"
             if !self.needsBinaryRestart && fm.fileExists(atPath: restartMarker) {
                 let newVersion = (try? String(contentsOfFile: restartMarker, encoding: .utf8)
                     .trimmingCharacters(in: .whitespacesAndNewlines)) ?? ""
@@ -390,6 +405,50 @@ public class EventMonitor: ObservableObject {
 
     // MARK: - Remote origins
 
+    private static let remoteEventTypes: Set<String> = ["permission", "stop", "notification", "info"]
+
+    /// RemoteEventSink: one event file relayed from a remote host. Validated
+    /// more strictly than local files since it crossed a machine boundary.
+    public func ingestRemoteEvent(_ dict: [String: Any], origin: String) {
+        guard !origin.isEmpty,
+              let id = dict["id"] as? String,
+              id.count <= 128, id.range(of: #"^[A-Za-z0-9_-]+$"#, options: .regularExpression) != nil,
+              let type = dict["type"] as? String, EventMonitor.remoteEventTypes.contains(type)
+        else { return }
+        let sid = dict["session_id"] as? String ?? ""
+        guard sid.isEmpty || RemoteMessage.isValidSessionID(sid) else { return }
+        var clean = dict
+        clean["tty"] = ""  // a remote TTY means nothing on this Mac
+        let event = EventMonitor.makeEvent(from: clean, fallbackID: id, origin: origin)
+        DispatchQueue.main.async {
+            guard self.knownRemoteIDs.insert("\(origin)/\(id)").inserted else { return }
+            self.receive(event)
+            if event.type != "stop" { self.playSounds(for: [event.type]) }
+        }
+    }
+
+    public func ingestRemoteResolve(_ dict: [String: Any], origin: String) {
+        guard !origin.isEmpty else { return }
+        applyResolve(dict, origin: origin)
+    }
+
+    public func ingestRemoteWorking(sessionID: String, origin: String) {
+        guard !origin.isEmpty else { return }
+        DispatchQueue.main.async {
+            self.applyWorking([SessionKey(origin: origin, sessionID: sessionID)])
+        }
+    }
+
+    /// Heartbeat: merge the host's live sessions and record its liveness. The
+    /// next poll prunes remote sessions missing from `live`.
+    public func applyRemoteHeartbeat(origin: String, sessions discovered: [DiscoveredSession], live: Set<String>?) {
+        guard !origin.isEmpty else { return }
+        DispatchQueue.main.async {
+            SessionReconciler.merge(discovered, origin: origin, into: &self.sessions)
+            self.remoteLiveness[origin] = live.map { .live($0) } ?? .unknown
+        }
+    }
+
     /// Record a remote origin's liveness. `.live` comes from a heartbeat,
     /// `.disconnected` when its relay drops. Applied on the next poll.
     public func setLiveness(origin: String, _ state: OriginLiveness) {
@@ -409,8 +468,19 @@ public class EventMonitor: ObservableObject {
     }
 
     public func respond(to id: String, with response: String) {
-        try? response.write(
-            toFile: "\(responsesDir)/\(id)", atomically: true, encoding: .utf8)
+        // Called from the UI on the main thread.
+        if let event = events.first(where: { $0.id == id }), !event.origin.isEmpty {
+            // Remote card: the decision goes back over that host's relay. If it
+            // can't be delivered (host disconnected), leave the buttons live;
+            // the remote hook falls back to the terminal prompt on timeout.
+            guard remoteResponder?.respond(origin: event.origin, id: id, decision: response) == true else {
+                naviLog("remote respond failed for %@ on %@", id, event.origin)
+                return
+            }
+        } else {
+            try? response.write(
+                toFile: "\(responsesDir)/\(id)", atomically: true, encoding: .utf8)
+        }
         DispatchQueue.main.async {
             if let idx = self.events.firstIndex(where: { $0.id == id }) {
                 self.events[idx].resolved = true

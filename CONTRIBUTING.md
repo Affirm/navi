@@ -45,6 +45,9 @@ Run unit tests with `swift test`. Tests live in `Tests/NaviCoreTests/` and exerc
 | `hooks/hook.sh` | Main hook entrypoint for PermissionRequest, Stop, StopFailure, Notification, PostToolUse, PostToolUseFailure |
 | `hooks/pretooluse.sh` | Lightweight PreToolUse hook — captures `tool_use_id` for auto-dismiss |
 | `Tests/hooks/test_headless.sh` | Headless hook tests, run in Docker by `scripts/test-hooks-linux.sh` |
+| `hooks/relay.py` | Remote-hosts relay (stdlib Python): streams a server's events/heartbeats as JSONL on stdout, writes responses read from stdin |
+| `Sources/NaviCore/RelaySource.generated.swift` | Embedded copy of `relay.py`; regenerate with `scripts/embed-relay.sh` (a test fails on drift) |
+| `Tests/relay/test_relay.py` | `relay.py` tests: `python3 -m unittest discover -s Tests/relay` |
 | `hooks/parse_event.py` | Parses hook payload JSON, writes event/resolve files to `/tmp/navi/events/` |
 | `docs/EXTENSION_API.md` | Public contract for external info-event producers — schema, atomicity rules, security constraints |
 | `build.sh` | Hook-time install entrypoint: fetches the published release for the version in `plugin.json`, verifies checksums.txt + Sigstore attestation, extracts `Navi.app` |
@@ -72,6 +75,25 @@ per origin: the local PID scan of `~/.claude/sessions/` yields `.live(ids)` (or
 reports `.live(ids)` from its relay heartbeat, or `.disconnected`, which keeps
 its sessions and flags them instead of pruning. Enrichment (git, transcripts,
 PRs) and terminal focus only ever run for local sessions.
+
+### Remote hosts (experimental, flag `remote-hosts`, default OFF)
+
+Navi can monitor Claude Code sessions on the user's own servers over SSH.
+`RemoteBridge` (NaviCore) keeps one process per enabled host:
+`ssh -T -o BatchMode=yes … -- <alias> python3 -c 'import base64;exec(base64.b64decode("…"))'`.
+The relay source is the copy embedded in the app, so the server always runs
+the matching version and nothing is installed for the relay itself. stdin is
+the control channel (approve/deny lines), stdout carries JSONL events and a
+heartbeat every 3s with the host's live sessions. The relay keeps
+`/tmp/navi/relay.alive` fresh so headless `hook.sh` knows to wait for a
+decision. Security rules: transport is SSH stdio only (never a network
+port); Navi only connects to hosts the user added; aliases are validated so
+they can't be parsed as ssh options; remote event/response IDs are validated
+on both ends. Settings: `NaviExp.RemoteHostsEnabled`, host list in
+`NaviExp.RemoteHosts`, mirrored to `/tmp/navi/features/remote-hosts` as JSON.
+Tests use `LocalRelayTransport` (runs `hooks/relay.py` with a private
+`--root`) or `CommandTransport` (canned JSONL) instead of SSH. Run the hook
+and relay tests on Linux with `scripts/test-hooks-linux.sh`.
 
 ### Event Flow
 

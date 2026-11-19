@@ -77,6 +77,29 @@ class FloatingWindowManager: ObservableObject {
         didSet { UserDefaults.standard.set(contextAlertThreshold2, forKey: "NaviExp.ContextAlert.T2") }
     }
 
+    /// Remote hosts (experimental, default OFF): monitor Claude Code sessions
+    /// on the user's own servers over SSH. See RemoteBridge.
+    @Published var remoteHostsEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(remoteHostsEnabled, forKey: RemoteHostsSettings.enabledKey)
+            RemoteHostsSettings.syncFlag(enabled: remoteHostsEnabled, hosts: remoteHosts)
+        }
+    }
+
+    /// Hosts the user explicitly added. Navi never connects anywhere else.
+    @Published var remoteHosts: [RemoteHostConfig] {
+        didSet {
+            RemoteHostsSettings.saveHosts(remoteHosts)
+            RemoteHostsSettings.syncFlag(enabled: remoteHostsEnabled, hosts: remoteHosts)
+        }
+    }
+
+    /// Feature flags the relay mirrors onto remote hosts so their headless
+    /// hooks write the same signals local hooks do.
+    var remoteRelayFeatures: [String] {
+        ["auto-dismiss", "session-status"] + (sessionNamesEnabled ? ["session-names"] : [])
+    }
+
     var anyEnrichmentToggleOn: Bool {
         showFolderEnabled || showGitEnabled || showModeEnabled || showModelEnabled || showSubagentsEnabled || showContextEnabled || contextAlertsEnabled
     }
@@ -105,6 +128,7 @@ class FloatingWindowManager: ObservableObject {
         FeatureFlags.set("session-names", enabled: sessionNamesEnabled)
         FeatureFlags.set("permission-details", enabled: permissionDetailsEnabled)
         FeatureFlags.set("context-alerts", enabled: contextAlertsEnabled)
+        RemoteHostsSettings.syncFlag(enabled: remoteHostsEnabled, hosts: remoteHosts)
         // Core features — always enabled. Flag files written so hooks that
         // still gate on `/tmp/navi/features/<name>` continue to work.
         FeatureFlags.set("terminal-focus", enabled: true)
@@ -203,6 +227,15 @@ class FloatingWindowManager: ObservableObject {
             showContextEnabled = false
         } else {
             showContextEnabled = UserDefaults.standard.bool(forKey: "NaviExp.ShowContext")
+        }
+        // Remote hosts — default OFF: it opens SSH connections, so it must be
+        // an explicit opt-in. Nil-check pattern so the default is recorded.
+        remoteHosts = RemoteHostsSettings.loadHosts()
+        if UserDefaults.standard.object(forKey: RemoteHostsSettings.enabledKey) == nil {
+            UserDefaults.standard.set(false, forKey: RemoteHostsSettings.enabledKey)
+            remoteHostsEnabled = false
+        } else {
+            remoteHostsEnabled = UserDefaults.standard.bool(forKey: RemoteHostsSettings.enabledKey)
         }
         // Clean up legacy feature flag files from removed options. Manual resize
         // became permanent in 1.1.x — no longer a toggle.
