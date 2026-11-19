@@ -2,9 +2,13 @@ import SwiftUI
 import AppKit
 import NaviCore
 
-class MenuBarManager: NSObject, ObservableObject {
+class MenuBarManager: NSObject, ObservableObject, NSPopoverDelegate {
     private var statusItem: NSStatusItem?
     private var popover: NSPopover?
+    /// Clicks in other apps while the popover is open. `.transient` alone only
+    /// closes it once the popover's window has become key, which doesn't
+    /// happen until the user clicks into it.
+    private var outsideClickMonitor: Any?
     private var monitor: EventMonitor?
     private var floatingManager: FloatingWindowManager?
     private var enrichmentService: EnrichmentService?
@@ -39,6 +43,7 @@ class MenuBarManager: NSObject, ObservableObject {
         }
         statusItem = nil
         popover?.close()
+        stopOutsideClickMonitor()
         popover = nil
         if let obs = eventObserver {
             NotificationCenter.default.removeObserver(obs)
@@ -69,6 +74,7 @@ class MenuBarManager: NSObject, ObservableObject {
             pop.contentSize = NSSize(width: floatingManager.popoverWidth, height: 500)
             pop.behavior = .transient
             pop.animates = true
+            pop.delegate = self
             pop.contentViewController = NSHostingController(
                 rootView: ContentView(monitor: monitor, floatingManager: floatingManager, enrichmentService: enrichmentService)
             )
@@ -80,5 +86,29 @@ class MenuBarManager: NSObject, ObservableObject {
             popover?.contentSize = NSSize(width: floatingManager.popoverWidth, height: popover?.contentSize.height ?? 500)
         }
         popover?.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        // Take focus so the popover behaves as transient right away.
+        NSApp.activate(ignoringOtherApps: true)
+        popover?.contentViewController?.view.window?.makeKey()
+        startOutsideClickMonitor()
+    }
+
+    private func startOutsideClickMonitor() {
+        guard outsideClickMonitor == nil else { return }
+        outsideClickMonitor = NSEvent.addGlobalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+        ) { [weak self] _ in
+            self?.popover?.performClose(nil)
+        }
+    }
+
+    private func stopOutsideClickMonitor() {
+        if let m = outsideClickMonitor {
+            NSEvent.removeMonitor(m)
+            outsideClickMonitor = nil
+        }
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        stopOutsideClickMonitor()
     }
 }
