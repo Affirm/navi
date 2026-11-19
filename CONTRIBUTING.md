@@ -48,6 +48,7 @@ Run unit tests with `swift test`. Tests live in `Tests/NaviCoreTests/` and exerc
 | `hooks/relay.py` | Remote-hosts relay (stdlib Python): streams a server's events/heartbeats as JSONL on stdout, writes responses read from stdin |
 | `Sources/NaviCore/RelaySource.generated.swift` | Embedded copy of `relay.py`; regenerate with `scripts/embed-relay.sh` (a test fails on drift) |
 | `Tests/relay/test_relay.py` | `relay.py` tests: `python3 -m unittest discover -s Tests/relay` |
+| `scripts/dev-remote-container.sh`, `scripts/dev-remote/` | Disposable SSH "remote host" container for local testing |
 | `hooks/parse_event.py` | Parses hook payload JSON, writes event/resolve files to `/tmp/navi/events/` |
 | `docs/EXTENSION_API.md` | Public contract for external info-event producers — schema, atomicity rules, security constraints |
 | `build.sh` | Hook-time install entrypoint: fetches the published release for the version in `plugin.json`, verifies checksums.txt + Sigstore attestation, extracts `Navi.app` |
@@ -94,6 +95,21 @@ on both ends. Settings: `NaviExp.RemoteHostsEnabled`, host list in
 Tests use `LocalRelayTransport` (runs `hooks/relay.py` with a private
 `--root`) or `CommandTransport` (canned JSONL) instead of SSH. Run the hook
 and relay tests on Linux with `scripts/test-hooks-linux.sh`.
+
+UI lives in `Sources/Navi/RemoteHostsWindow.swift` (Settings → Experimental
+→ Manage remote hosts…); its logic is in NaviCore so it's testable:
+`SSHConfigParser` (Host aliases from ~/.ssh/config, following `Include`),
+`SSHEffectiveConfig` (`ssh -G`), `HostProbe` (Test connection),
+`RemoteInstall` (install/uninstall steps, `--json` outcome parsing with a
+fallback for older Claude Code, offline copy to `~/.navi/plugin`) and
+`ProcessRunner`. Every install/uninstall shows the exact commands and runs
+only after confirmation.
+
+To try it without a real server, `scripts/dev-remote-container.sh` starts a
+throwaway sshd container (python3 + this checkout's `hooks/`) and prints a
+`Host navi-dev` block for your ssh config. Inside it,
+`navi-fake-session start|permission|stop|working|end` simulates a Claude
+session without Claude Code. `scripts/dev-remote-container.sh stop` removes it.
 
 ### Event Flow
 

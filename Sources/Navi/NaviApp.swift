@@ -39,6 +39,7 @@ struct NaviApp: App {
                     if floatingManager.menuBarEnabled { menuBar.enable() }
                     remoteBridge.attach(sink: monitor)
                     monitor.remoteResponder = remoteBridge
+                    RemoteHostsWindow.shared.configure(floatingManager: floatingManager, bridge: remoteBridge)
                     configureRemoteHosts()
                 }
                 .onReceive(floatingManager.$remoteHostsEnabled) { _ in configureRemoteHosts() }

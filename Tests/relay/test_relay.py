@@ -121,11 +121,15 @@ class RelayTests(unittest.TestCase):
         d = os.path.join(self.root, "events")
         with open(os.path.join(d, ".partial.tmp"), "w") as f:
             f.write("{")
+        # Backdate before it becomes visible as *.json, or the relay may
+        # forward it while it still looks fresh.
         stale = os.path.join(d, "1-" + "cd" * 16 + ".json")
-        with open(stale, "w") as f:
+        staging = os.path.join(d, ".stale.tmp")
+        with open(staging, "w") as f:
             json.dump({"id": "x", "type": "stop"}, f)
         old = time.time() - 3600
-        os.utime(stale, (old, old))
+        os.utime(staging, (old, old))
+        os.rename(staging, stale)
         r.next("heartbeat")
         time.sleep(0.5)
         self.assertEqual(os.listdir(d), [".partial.tmp"])

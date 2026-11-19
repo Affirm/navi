@@ -3,3 +3,4 @@ Navi.app/
 .build/
 .swiftpm/
 /out/
+/.dev-remote/

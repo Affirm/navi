@@ -55,6 +55,23 @@ struct SessionSection: View {
                                 .font(.system(size: 11 * s, design: .monospaced))
                                 .foregroundStyle(.tertiary)
 
+                            if !group.info.isLocal {
+                                // Host badge: which server this session runs on.
+                                HStack(spacing: 3) {
+                                    Image(systemName: "server.rack")
+                                        .font(.system(size: 9 * s))
+                                    Text(group.info.origin)
+                                        .font(.system(size: 10 * s, weight: .medium))
+                                        .lineLimit(1)
+                                }
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 1)
+                                .background(Capsule().fill(Color.secondary.opacity(0.15)))
+                                .foregroundStyle(.secondary)
+                                .help("Running on \(group.info.origin)")
+                                .padding(.leading, 4)
+                            }
+
                             Spacer()
 
                             if !group.status.label.isEmpty {

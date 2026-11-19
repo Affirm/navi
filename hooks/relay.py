@@ -302,4 +302,11 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    rc = main(sys.argv[1:])
+    # The stdin reader thread may be blocked in readline(); a normal
+    # interpreter shutdown can stall on it. Cleanup is done, so flush and go.
+    try:
+        sys.stdout.flush()
+    except (OSError, ValueError):
+        pass
+    os._exit(rc)

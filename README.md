@@ -46,7 +46,11 @@ Hooks are registered automatically. Navi builds and launches itself the first ti
 
 ## Settings
 
-Click the gear icon to open settings. The **General** tab covers auto-launch, sounds (per-event, any macOS system sound), display (font scale), and stable features like the menu bar icon, session names, permission details, and session row badges. The **Experimental** tab holds newer features: sub-agents, context size bar, and context window alerts with configurable warning/critical thresholds.
+Click the gear icon to open settings. The **General** tab covers auto-launch, sounds (per-event, any macOS system sound), display (font scale), and stable features like the menu bar icon, session names, permission details, and session row badges. The **Experimental** tab holds newer features: sub-agents, context size bar, context window alerts with configurable warning/critical thresholds, and remote hosts.
+
+### Remote hosts (experimental, off by default)
+
+Navi can also monitor, and answer permission requests for, Claude Code sessions on your own Linux servers. Turn on **Remote hosts** in Settings → Experimental and click **Manage remote hosts…**: pick hosts from your `~/.ssh/config` (or type `user@host`), **Test connection**, and **Install Navi** on the host (Navi shows the exact `claude plugin …` commands before running them). Navi connects with `ssh -o BatchMode=yes` only to hosts you add, and streams events through a small relay that lives for the length of the SSH connection; nothing listens on a network port. If a host needs a host-key confirmation or passphrase, run `ssh <host>` once in Terminal first. Remote sessions show a host badge, never offer jump-to-terminal, and show **Disconnected** while the connection is down. The server needs `python3`, and Claude Code sessions that were already running when you installed must be restarted so they load the hooks.
 
 ## Manual Setup
 

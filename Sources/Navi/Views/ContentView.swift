@@ -403,6 +403,12 @@ struct ContentView: View {
                 contextAlertThresholdPicker
             }
 
+            settingsRow("Remote hosts",
+                subtitle: "Monitor and answer permission requests for Claude Code sessions on your own servers over SSH.",
+                isOn: Binding(get: { floatingManager.remoteHostsEnabled }, set: { floatingManager.remoteHostsEnabled = $0 }))
+            Button("Manage remote hosts…") { RemoteHostsWindow.shared.show() }
+                .controlSize(.small)
+
             Spacer()
         }
         .padding(12)
