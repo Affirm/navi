@@ -57,13 +57,13 @@ struct SessionSection: View {
                             Image(systemName: "folder.fill")
                                 .foregroundStyle(.secondary)
                                 .font(.system(size: 11 * s))
+                            // The session ID is only useful for debugging: keep it in
+                            // the tooltip instead of spending row width on it.
                             Text(group.info.displayName(useSessionName: floatingManager.sessionNamesEnabled))
                                 .font(.system(size: 13 * s, weight: .semibold))
-
-                            Text(group.info.shortSession)
-                                .font(.system(size: 11 * s, design: .monospaced))
-                                .foregroundStyle(.tertiary)
-
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                                .help("Session \(group.info.id)")
 
                             Spacer()
 
