@@ -17,12 +17,13 @@ public class EventMonitor: ObservableObject, RemoteEventSink {
     /// Liveness reported by remote origins (keyed by host alias). The local
     /// origin's liveness is recomputed from the PID scan on every poll.
     private var remoteLiveness: [String: OriginLiveness] = [:]
-    /// Sessions the user dismissed (✕) while they were still alive. Discovery
-    /// and heartbeats skip them; new activity (an event or a new turn) brings
-    /// them back, and the entry is dropped once the session ends.
     /// Conversation titles for local sessions (remote ones come from the relay).
     private let localTitles = TranscriptTitleCache()
-    private(set) var dismissed = Set<SessionKey>() {
+    /// Sessions the user dismissed (✕) while they were still alive. Discovery
+    /// and heartbeats skip them; any update (an event, a new turn, a status
+    /// change in the registry) brings them back, and the entry is dropped
+    /// once the session ends.
+    private(set) var dismissed: [SessionKey: SessionReconciler.Dismissal] = [:] {
         didSet { if dismissed != oldValue { saveDismissed() } }
     }
     /// Where dismissals persist across restarts (nil = don't persist).
@@ -233,28 +234,37 @@ public class EventMonitor: ObservableObject, RemoteEventSink {
                 statusUpdatedAt: parsed.statusUpdatedAt, title: title))
         }
         localTitles.forget(except: Set(discovered.filter(\.alive).map(\.sessionID)))
+        SessionReconciler.wakeDismissed(&dismissed, discovered: discovered, origin: "", trustClock: true)
         let added = SessionReconciler.merge(
             discovered, origin: "", into: &sessions,
-            ttyLookup: EventMonitor.lookupTTY, skip: dismissed)
+            ttyLookup: EventMonitor.lookupTTY, skip: Set(dismissed.keys))
         for key in added {
             if let info = sessions[key] { enrichmentService?.refresh(for: info) }
         }
         return Set(discovered.filter(\.alive).map(\.sessionID))
     }
 
-    /// Stored as "origin\tsessionID" strings ("" origin = this Mac).
-    static func loadDismissed(from store: UserDefaults?) -> Set<SessionKey> {
+    /// Stored as "origin\tsessionID\tdismissedAt" strings ("" origin = this
+    /// Mac, time in epoch seconds). Entries without a time (older builds)
+    /// count as dismissed at load time.
+    static func loadDismissed(from store: UserDefaults?, now: Date = Date()) -> [SessionKey: SessionReconciler.Dismissal] {
         let raw = store?.stringArray(forKey: dismissedKey) ?? []
-        return Set(raw.compactMap { entry in
-            let parts = entry.split(separator: "\t", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
-            guard parts.count == 2, RemoteMessage.isValidSessionID(parts[1]) else { return nil }
-            return SessionKey(origin: parts[0], sessionID: parts[1])
-        })
+        var out: [SessionKey: SessionReconciler.Dismissal] = [:]
+        for entry in raw {
+            let parts = entry.split(separator: "\t", maxSplits: 2, omittingEmptySubsequences: false).map(String.init)
+            guard parts.count >= 2, RemoteMessage.isValidSessionID(parts[1]) else { continue }
+            let at = parts.count == 3 ? Double(parts[2]).map { Date(timeIntervalSince1970: $0) } : nil
+            out[SessionKey(origin: parts[0], sessionID: parts[1])] = .init(at: at ?? now)
+        }
+        return out
     }
 
     private func saveDismissed() {
         guard let store = dismissedStore else { return }
-        store.set(dismissed.map { "\($0.origin)\t\($0.sessionID)" }.sorted(), forKey: EventMonitor.dismissedKey)
+        let raw = dismissed.map { key, d in
+            "\(key.origin)\t\(key.sessionID)\t\(Int(d.at.timeIntervalSince1970))"
+        }
+        store.set(raw.sorted(), forKey: EventMonitor.dismissedKey)
     }
 
     /// Look up a local process's controlling TTY so terminal focus works
@@ -358,7 +368,7 @@ public class EventMonitor: ObservableObject, RemoteEventSink {
     private func applyWorking(_ keys: Set<SessionKey>) {
         for key in keys {
             // A new turn is new activity: let a dismissed session come back.
-            dismissed.remove(key)
+            dismissed.removeValue(forKey: key)
             if sessions[key] != nil {
                 sessions[key]!.finishedUnseen = false
                 sessions[key]!.lastEventType = "working"
@@ -413,8 +423,12 @@ public class EventMonitor: ObservableObject, RemoteEventSink {
     private func updateSession(for event: NaviEvent) {
         guard !event.sessionID.isEmpty else { return }
         let sid = event.sessionKey
-        // A real event (not a passive info card) brings a dismissed session back.
-        if event.type != "info" { dismissed.remove(sid) }
+        // Any update brings a dismissed session back. Local event files can
+        // outlive a restart, so only ones written after the dismissal count;
+        // remote events arrive live (and are deduplicated by ID).
+        if let d = dismissed[sid], !event.origin.isEmpty || event.timestamp > d.at {
+            dismissed.removeValue(forKey: sid)
+        }
 
         if sessions[sid] == nil {
             // Don't create a phantom session entry for external info events —
@@ -507,7 +521,8 @@ public class EventMonitor: ObservableObject, RemoteEventSink {
     public func applyRemoteHeartbeat(origin: String, sessions discovered: [DiscoveredSession], live: Set<String>?) {
         guard !origin.isEmpty else { return }
         DispatchQueue.main.async {
-            SessionReconciler.merge(discovered, origin: origin, into: &self.sessions, skip: self.dismissed)
+            SessionReconciler.wakeDismissed(&self.dismissed, discovered: discovered, origin: origin, trustClock: false)
+            SessionReconciler.merge(discovered, origin: origin, into: &self.sessions, skip: Set(self.dismissed.keys))
             self.remoteLiveness[origin] = live.map { .live($0) } ?? .unknown
         }
     }
@@ -525,7 +540,7 @@ public class EventMonitor: ObservableObject, RemoteEventSink {
         guard !origin.isEmpty else { return }
         DispatchQueue.main.async {
             self.remoteLiveness.removeValue(forKey: origin)
-            self.dismissed = self.dismissed.filter { $0.origin != origin }
+            self.dismissed = self.dismissed.filter { $0.key.origin != origin }
             self.events.removeAll { $0.origin == origin }
             self.sessions = self.sessions.filter { $0.key.origin != origin }
         }
@@ -559,13 +574,22 @@ public class EventMonitor: ObservableObject, RemoteEventSink {
         }
     }
 
+    /// A dismissal recording the status the session had when hidden, so a
+    /// later change in the registry is recognised as an update.
+    static func dismissal(of info: SessionInfo?, now: Date = Date()) -> SessionReconciler.Dismissal {
+        // No registry status yet (known only from events): let the first
+        // sighting set the baseline instead of counting as a change.
+        guard let info, !info.claudeStatus.isEmpty || info.statusUpdatedAt != nil else { return .init(at: now) }
+        return .init(at: now, baseline: .init(status: info.claudeStatus, updatedAt: info.statusUpdatedAt))
+    }
+
     public func dismissSession(_ key: SessionKey) {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
             self.events.removeAll { $0.sessionKey == key && !$0.isPending }
-            self.sessions.removeValue(forKey: key)
+            let info = self.sessions.removeValue(forKey: key)
             // Keep it hidden until it does something new (see `dismissed`).
-            self.dismissed.insert(key)
+            self.dismissed[key] = EventMonitor.dismissal(of: info)
             // Tell the enrichment service to drop caches for this sid and any
             // cwds no longer referenced. Without this, gitCache /
             // transcriptCache / prCache (and their @Published mirrors) grow
@@ -591,7 +615,7 @@ public class EventMonitor: ObservableObject, RemoteEventSink {
             guard let self = self else { return }
             let dismissed = Array(self.sessions.keys)
             self.events.removeAll { !$0.isPending }
-            self.dismissed.formUnion(self.sessions.keys)
+            for (key, info) in self.sessions { self.dismissed[key] = EventMonitor.dismissal(of: info) }
             self.sessions.removeAll()
             self.evictEnrichment(for: dismissed)
         }

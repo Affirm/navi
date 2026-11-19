@@ -128,11 +128,61 @@ public enum SessionReconciler {
         return added
     }
 
+    /// A session hidden with ✕: when, and the registry status it had then.
+    public struct Dismissal: Equatable {
+        public var at: Date
+        /// Status and `updatedAt` last seen while hidden; nil until known.
+        public var baseline: Baseline?
+
+        public struct Baseline: Equatable {
+            public var status: String
+            public var updatedAt: Date?
+            public init(status: String, updatedAt: Date?) {
+                self.status = status
+                self.updatedAt = updatedAt
+            }
+        }
+
+        public init(at: Date, baseline: Baseline? = nil) {
+            self.at = at
+            self.baseline = baseline
+        }
+    }
+
+    /// Bring back hidden sessions whose registry entry changed since they were
+    /// hidden: any status change (busy/idle/waiting) is an update the user
+    /// should see. With no baseline yet, `updatedAt` after the dismissal counts
+    /// when `trustClock` (same machine's clock, i.e. this Mac); otherwise the
+    /// first sighting only records the baseline. Returns the woken keys.
+    @discardableResult
+    public static func wakeDismissed(
+        _ dismissed: inout [SessionKey: Dismissal],
+        discovered: [DiscoveredSession],
+        origin: String,
+        trustClock: Bool
+    ) -> Set<SessionKey> {
+        var woken = Set<SessionKey>()
+        for d in discovered {
+            let key = SessionKey(origin: origin, sessionID: d.sessionID)
+            guard let entry = dismissed[key] else { continue }
+            let seen = Dismissal.Baseline(status: d.claudeStatus, updatedAt: d.statusUpdatedAt)
+            if let base = entry.baseline {
+                if base != seen { woken.insert(key) }
+            } else if trustClock, let t = d.statusUpdatedAt, t > entry.at {
+                woken.insert(key)
+            } else {
+                dismissed[key]!.baseline = seen
+            }
+        }
+        for key in woken { dismissed.removeValue(forKey: key) }
+        return woken
+    }
+
     /// Drop dismissals for sessions that are gone, so a dismissal doesn't
     /// outlive the session it hid. Origins without a `.live` set are kept.
-    public static func pruneDismissed(_ dismissed: Set<SessionKey>,
-                                      liveness: [String: OriginLiveness]) -> Set<SessionKey> {
-        dismissed.filter { key in
+    public static func pruneDismissed(_ dismissed: [SessionKey: Dismissal],
+                                      liveness: [String: OriginLiveness]) -> [SessionKey: Dismissal] {
+        dismissed.filter { key, _ in
             if case .live(let ids)? = liveness[key.origin] { return ids.contains(key.sessionID) }
             return true
         }

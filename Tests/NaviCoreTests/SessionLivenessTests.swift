@@ -204,9 +204,10 @@ struct DismissedSessionTests {
         let a = SessionKey(origin: "devbox", sessionID: "a")
         let b = SessionKey(origin: "devbox", sessionID: "b")
         let l = SessionKey(sessionID: "l")
-        let kept = SessionReconciler.pruneDismissed([a, b, l], liveness: ["devbox": .live(["a"]), "": .unknown])
-        #expect(kept == [a, l])
-        #expect(SessionReconciler.pruneDismissed([a], liveness: ["devbox": .disconnected]) == [a])
+        let d = SessionReconciler.Dismissal(at: Date())
+        let kept = SessionReconciler.pruneDismissed([a: d, b: d, l: d], liveness: ["devbox": .live(["a"]), "": .unknown])
+        #expect(Set(kept.keys) == [a, l])
+        #expect(SessionReconciler.pruneDismissed([a: d], liveness: ["devbox": .disconnected]).keys.contains(a))
     }
 }
 

@@ -424,11 +424,12 @@ struct DismissalPersistenceTests {
         #expect(await eventuallyOnMain { first.sessions[key] != nil })
         first.dismissSession(key)
         #expect(await eventuallyOnMain { first.sessions[key] == nil })
-        #expect(store.stringArray(forKey: EventMonitor.dismissedKey) == ["ops\ts1"])
+        let stored = try #require(store.stringArray(forKey: EventMonitor.dismissedKey))
+        #expect(stored.count == 1 && stored[0].hasPrefix("ops\ts1\t"))
 
         // "Restart": a new monitor with the same store keeps it hidden.
         let second = EventMonitor(stateDir: dir.path, watch: false, dismissedStore: store)
-        #expect(second.dismissed == [key])
+        #expect(Set(second.dismissed.keys) == [key])
         beat(second)
         try await Task.sleep(nanoseconds: 100_000_000)
         #expect(await MainActor.run { second.sessions[key] } == nil)
@@ -444,7 +445,73 @@ struct DismissalPersistenceTests {
         let store = try #require(UserDefaults(suiteName: suite))
         defer { store.removePersistentDomain(forName: suite) }
         store.set(["ops\tgood-1", "no-tab", "ops\t../bad", "\tlocal_2"], forKey: EventMonitor.dismissedKey)
-        #expect(EventMonitor.loadDismissed(from: store) ==
+        #expect(Set(EventMonitor.loadDismissed(from: store).keys) ==
                 [SessionKey(origin: "ops", sessionID: "good-1"), SessionKey(sessionID: "local_2")])
+    }
+
+    @Test func storedTimeIsRestored() throws {
+        let suite = "navi-dismiss-\(UUID().uuidString)"
+        let store = try #require(UserDefaults(suiteName: suite))
+        defer { store.removePersistentDomain(forName: suite) }
+        store.set(["ops\ts1\t1000"], forKey: EventMonitor.dismissedKey)
+        #expect(EventMonitor.loadDismissed(from: store)[SessionKey(origin: "ops", sessionID: "s1")]?.at
+                == Date(timeIntervalSince1970: 1000))
+    }
+}
+
+@Suite("Hidden sessions wake on updates", .serialized)
+struct DismissWakeTests {
+    private let t0 = Date(timeIntervalSince1970: 1_000)
+    private func seen(_ status: String, _ t: TimeInterval) -> DiscoveredSession {
+        DiscoveredSession(sessionID: "s", pid: 1, alive: true, claudeStatus: status,
+                          statusUpdatedAt: Date(timeIntervalSince1970: t))
+    }
+
+    @Test func statusChangeAfterBaselineWakes() {
+        let key = SessionKey(origin: "h", sessionID: "s")
+        var d: [SessionKey: SessionReconciler.Dismissal] = [key: .init(at: t0)]
+        // First sighting on a remote host only records the baseline.
+        #expect(SessionReconciler.wakeDismissed(&d, discovered: [seen("idle", 500)], origin: "h", trustClock: false).isEmpty)
+        #expect(SessionReconciler.wakeDismissed(&d, discovered: [seen("idle", 500)], origin: "h", trustClock: false).isEmpty)
+        #expect(SessionReconciler.wakeDismissed(&d, discovered: [seen("busy", 2_000)], origin: "h", trustClock: false) == [key])
+        #expect(d.isEmpty)
+    }
+
+    @Test func localUpdateAfterDismissalWakesWithoutBaseline() {
+        let key = SessionKey(sessionID: "s")
+        var d: [SessionKey: SessionReconciler.Dismissal] = [key: .init(at: t0)]
+        #expect(SessionReconciler.wakeDismissed(&d, discovered: [seen("idle", 900)], origin: "", trustClock: true).isEmpty)
+        var fresh: [SessionKey: SessionReconciler.Dismissal] = [key: .init(at: t0)]
+        #expect(SessionReconciler.wakeDismissed(&fresh, discovered: [seen("idle", 1_100)], origin: "", trustClock: true) == [key])
+    }
+
+    @Test func remoteStatusChangeBringsSessionBack() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("navi-test-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let monitor = EventMonitor(stateDir: dir.path, watch: false)
+        let key = SessionKey(origin: "ops", sessionID: "s")
+        monitor.applyRemoteHeartbeat(origin: "ops", sessions: [seen("busy", 500)], live: ["s"])
+        #expect(await eventuallyOnMain { monitor.sessions[key] != nil })
+        monitor.dismissSession(key)
+        #expect(await eventuallyOnMain { monitor.sessions[key] == nil })
+        monitor.applyRemoteHeartbeat(origin: "ops", sessions: [seen("busy", 500)], live: ["s"])
+        try await Task.sleep(nanoseconds: 100_000_000)
+        #expect(await MainActor.run { monitor.sessions[key] } == nil)
+        monitor.applyRemoteHeartbeat(origin: "ops", sessions: [seen("idle", 600)], live: ["s"])
+        #expect(await eventuallyOnMain { monitor.sessions[key]?.claudeStatus == "idle" })
+    }
+
+    @Test func infoEventAlsoWakes() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("navi-test-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let monitor = EventMonitor(stateDir: dir.path, watch: false)
+        let key = SessionKey(origin: "ops", sessionID: "s")
+        monitor.applyRemoteHeartbeat(origin: "ops", sessions: [seen("idle", 500)], live: ["s"])
+        #expect(await eventuallyOnMain { monitor.sessions[key] != nil })
+        monitor.dismissSession(key)
+        #expect(await eventuallyOnMain { monitor.dismissed[key] != nil })
+        monitor.ingestRemoteEvent(["id": "7-" + String(repeating: "c", count: 32), "type": "info",
+                                   "session_id": "s"], origin: "ops")
+        #expect(await eventuallyOnMain { monitor.dismissed[key] == nil })
     }
 }

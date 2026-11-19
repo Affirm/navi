@@ -39,6 +39,23 @@ struct SessionSection: View {
         group.hasPending || group.events.contains { $0.type == "info" && !$0.resolved }
     }
 
+    private func openConversation() {
+        monitor.acknowledge(group.info.key)
+        let info = group.info
+        DispatchQueue.global(qos: .userInitiated).async {
+            let url = ConversationLink.url(for: info)
+            DispatchQueue.main.async {
+                if let url {
+                    NSWorkspace.shared.open(url)
+                } else if info.isLocal && (!info.tty.isEmpty || info.pid > 0) {
+                    focusTerminal(tty: info.tty, pid: info.pid)
+                } else {
+                    NSSound.beep()
+                }
+            }
+        }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             // Session header
@@ -64,7 +81,7 @@ struct SessionSection: View {
                                 .lineLimit(1)
                                 .truncationMode(.tail)
                                 // Full name (rows truncate long ones) plus the session ID.
-                                .help("\(group.info.displayName(useSessionName: floatingManager.sessionNamesEnabled))\nSession \(group.info.id)")
+                                .help("\(group.info.displayName(useSessionName: floatingManager.sessionNamesEnabled))\nSession \(group.info.id)\nDouble-click to open the conversation")
 
                             Spacer()
 
@@ -91,6 +108,9 @@ struct SessionSection: View {
                         .padding(.vertical, 6)
                     }
                     .buttonStyle(.plain)
+                    // Double-click: open the conversation where it runs (Claude
+                    // app / VS Code), else focus its terminal.
+                    .simultaneousGesture(TapGesture(count: 2).onEnded { openConversation() })
 
                     // Remote sessions run on another machine: their tty/pid
                     // mean nothing here, so never try to focus a local terminal.
