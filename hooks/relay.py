@@ -51,6 +51,7 @@ MAX_EVENT_BYTES = 1024 * 1024
 STALE_EVENT_SECONDS = 120
 POLL_SECONDS = 0.3
 TITLE_MAX = 120
+PROMPT_TITLE_MAX = 70   # first-prompt fallback: a label, not the whole message
 TITLE_TAIL_BYTES = 4 * 1024 * 1024   # first read of a big transcript: tail only
 TITLE_READ_BYTES = 8 * 1024 * 1024   # max bytes read per heartbeat per transcript
 HEARTBEAT_SECONDS = 3.0
@@ -141,7 +142,8 @@ def _clean_title(text):
 
 def _first_prompt(d):
     """Text of a real user prompt line, or "" (tool results, meta, commands)."""
-    if d.get("type") != "user" or d.get("isMeta") or d.get("isSidechain"):
+    if (d.get("type") != "user" or d.get("isMeta") or d.get("isSidechain")
+            or d.get("isCompactSummary")):
         return ""
     msg = d.get("message")
     content = msg.get("content") if isinstance(msg, dict) else None
@@ -151,9 +153,11 @@ def _first_prompt(d):
                            and isinstance(x.get("text"), str))
     if not isinstance(content, str):
         return ""
-    content = _clean_title(content)
-    if not content or content.startswith("<"):
+    content = " ".join(content.split())
+    if not content or content.startswith("<") or content.startswith("This session is being continued"):
         return ""
+    if len(content) > PROMPT_TITLE_MAX:
+        content = content[:PROMPT_TITLE_MAX - 1].rstrip() + "\u2026"
     return content
 
 
@@ -285,12 +289,16 @@ def scan_sessions(sessions_dir, is_claude=looks_like_claude, titles=None):
         for key in ("cwd", "name", "status"):
             if isinstance(d.get(key), str):
                 entry[key] = d[key]
+        # nameSource "derived" = a placeholder Claude Code generated (e.g.
+        # "<folder>-84" for Remote Control sessions), not a name anyone chose.
+        # Don't let it outrank the conversation title; keep it as a fallback.
+        derived = entry.pop("name", "") if d.get("nameSource") == "derived" else ""
         if isinstance(d.get("updatedAt"), (int, float)):
             entry["updatedAt"] = d["updatedAt"]
-        if titles is not None:
-            title = titles.title(sid, entry.get("cwd", ""))
-            if title:
-                entry["title"] = title
+        title = titles.title(sid, entry.get("cwd", "")) if titles is not None else ""
+        title = title or derived
+        if title:
+            entry["title"] = title
         live.append(entry)
     if titles is not None:
         titles.forget_except({e["sessionId"] for e in live})

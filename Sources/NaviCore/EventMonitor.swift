@@ -395,7 +395,8 @@ public class EventMonitor: ObservableObject, RemoteEventSink {
                 shortSession: event.shortSession,
                 cwd: event.cwd,
                 tty: event.tty,
-                sessionName: event.sessionName,
+                // Remote names come from heartbeats (see SessionReconciler.merge).
+                sessionName: event.origin.isEmpty ? event.sessionName : "",
                 pid: event.pid,
                 lastActivity: event.timestamp,
                 origin: event.origin
@@ -416,8 +417,11 @@ public class EventMonitor: ObservableObject, RemoteEventSink {
             if !event.tty.isEmpty {
                 sessions[sid]!.tty = event.tty
             }
-            // Always update session name — it can change via /rename
-            sessions[sid]!.sessionName = event.sessionName
+            // Always update session name — it can change via /rename. Remote
+            // names come from heartbeats instead (see SessionReconciler.merge).
+            if event.origin.isEmpty {
+                sessions[sid]!.sessionName = event.sessionName
+            }
         }
         if let info = sessions[sid], info.isLocal {
             enrichmentService?.refresh(for: info)

@@ -50,7 +50,8 @@ public struct DiscoveredSession: Equatable {
             pid: pid,
             alive: pid.map(isAlive) ?? false,
             cwd: dict["cwd"] as? String ?? "",
-            name: dict["name"] as? String ?? "",
+            // "derived" = placeholder Claude Code generated, not a chosen name.
+            name: dict["nameSource"] as? String == "derived" ? "" : dict["name"] as? String ?? "",
             claudeStatus: dict["status"] as? String ?? "",
             statusUpdatedAt: parseUpdatedAt(dict["updatedAt"]),
             title: dict["title"] as? String ?? ""
@@ -99,6 +100,9 @@ public enum SessionReconciler {
                 sessions[key]!.statusUpdatedAt = d.statusUpdatedAt
                 // Titles evolve (AI title arrives after the first exchange, /rename).
                 if !d.title.isEmpty { sessions[key]!.title = d.title }
+                // Remote: the heartbeat is the authority for the name (events
+                // from older hooks on the server may carry placeholder names).
+                if !origin.isEmpty { sessions[key]!.sessionName = d.name }
                 if d.alive, let pid = d.pid, sessions[key]!.pid != pid {
                     sessions[key]!.pid = pid
                 }

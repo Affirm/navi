@@ -189,6 +189,16 @@ class RelayTests(unittest.TestCase):
         tc = relay.TitleCache(projects)
         self.assertEqual(tc.title("s1", "/home/me/proj"), "Fix the login bug please")
 
+        # Compact summaries never become titles; long prompts are shortened.
+        other = os.path.join(tdir, "s2.jsonl")
+        with open(other, "w") as f:
+            f.write(json.dumps({"type": "user", "isCompactSummary": True,
+                                "message": {"content": "This session is being continued from..."}}) + "\n")
+            f.write(json.dumps({"type": "user", "message": {"content": "word " * 40}}) + "\n")
+        t2 = tc.title("s2", "/home/me/proj")
+        self.assertEqual(len(t2), relay.PROMPT_TITLE_MAX)
+        self.assertTrue(t2.startswith("word word") and t2.endswith("\u2026"))
+
         with open(path, "a") as f:  # AI title arrives later; incremental read
             f.write(json.dumps({"type": "ai-title", "aiTitle": "Login bug fix"}) + "\n")
         self.assertEqual(tc.title("s1", "/home/me/proj"), "Login bug fix")
@@ -213,6 +223,24 @@ class RelayTests(unittest.TestCase):
         live = relay.scan_sessions(self.sessions, is_claude=lambda p: True,
                                    titles=relay.TitleCache(projects))
         self.assertEqual(live[0]["title"], "T" * relay.TITLE_MAX)
+
+    def test_derived_name_is_only_a_title_fallback(self):
+        relay = self._relay_module()
+        projects = os.path.join(self.tmp.name, "projects")
+        os.makedirs(os.path.join(projects, "x"))
+        with open(os.path.join(projects, "x", "a.jsonl"), "w") as f:
+            f.write(json.dumps({"type": "user", "message": {"content": "Deploy the db"}}) + "\n")
+        for pid_name, sid, name, src in (("1", "a", "myapp-84", "derived"),
+                                         ("2", "b", "myapp-ff", "derived"),
+                                         ("3", "c", "My chosen name", "user")):
+            with open(os.path.join(self.sessions, pid_name + ".json"), "w") as f:
+                json.dump({"sessionId": sid, "pid": os.getpid(), "name": name, "nameSource": src}, f)
+        live = {e["sessionId"]: e for e in relay.scan_sessions(
+            self.sessions, is_claude=lambda p: True, titles=relay.TitleCache(projects))}
+        self.assertNotIn("name", live["a"])
+        self.assertEqual(live["a"]["title"], "Deploy the db")      # transcript beats placeholder
+        self.assertEqual(live["b"]["title"], "myapp-ff")         # no transcript: placeholder
+        self.assertEqual(live["c"]["name"], "My chosen name")      # chosen names untouched
 
     def test_missing_sessions_dir_means_no_sessions(self):
         os.rmdir(self.sessions)

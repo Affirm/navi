@@ -242,3 +242,28 @@ struct SessionTitleTests {
         #expect(sessions.first?.title == "Hello")
     }
 }
+
+@Suite("Derived names")
+struct DerivedNameTests {
+    @Test func derivedNameIsDroppedButChosenNameKept() {
+        let derived = DiscoveredSession.parse(["sessionId": "s", "pid": 1, "name": "myapp-84", "nameSource": "derived"],
+                                              isAlive: { _ in true })
+        #expect(derived?.name == "")
+        let chosen = DiscoveredSession.parse(["sessionId": "s", "pid": 1, "name": "Mine", "nameSource": "user"],
+                                             isAlive: { _ in true })
+        #expect(chosen?.name == "Mine")
+        let legacy = DiscoveredSession.parse(["sessionId": "s", "pid": 1, "name": "Old"], isAlive: { _ in true })
+        #expect(legacy?.name == "Old")
+    }
+
+    @Test func remoteNameFollowsHeartbeat() {
+        var t: [SessionKey: SessionInfo] = [:]
+        let key = SessionKey(origin: "ops", sessionID: "s")
+        SessionReconciler.merge([DiscoveredSession(sessionID: "s", pid: 1, alive: true, name: "", title: "Deploy the db")],
+                                origin: "ops", into: &t)
+        t[key]!.sessionName = "myapp-84"  // e.g. set by an event from older server hooks
+        SessionReconciler.merge([DiscoveredSession(sessionID: "s", pid: 1, alive: true, name: "", title: "Deploy the db")],
+                                origin: "ops", into: &t)
+        #expect(t[key]?.displayName(useSessionName: true) == "Deploy the db")
+    }
+}
