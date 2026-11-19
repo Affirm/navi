@@ -46,6 +46,9 @@ struct SessionSection: View {
             let url = ConversationLink.url(for: info)
             DispatchQueue.main.async {
                 if let url {
+                    // Close the tray popover now; the app hand-off doesn't
+                    // always take focus from Navi.
+                    NotificationCenter.default.post(name: .init("NaviClosePopover"), object: nil)
                     NSWorkspace.shared.open(url)
                 } else if info.isLocal && (!info.tty.isEmpty || info.pid > 0) {
                     focusTerminal(tty: info.tty, pid: info.pid)

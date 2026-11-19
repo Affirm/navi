@@ -9,10 +9,14 @@ class MenuBarManager: NSObject, ObservableObject, NSPopoverDelegate {
     /// closes it once the popover's window has become key, which doesn't
     /// happen until the user clicks into it.
     private var outsideClickMonitor: Any?
+    /// Navi losing focus (another app opened from a row, Cmd-Tab) also
+    /// closes the popover.
+    private var resignObserver: Any?
     private var monitor: EventMonitor?
     private var floatingManager: FloatingWindowManager?
     private var enrichmentService: EnrichmentService?
     private var eventObserver: Any?
+    private var closeObserver: Any?
 
     func attach(monitor: EventMonitor, floatingManager: FloatingWindowManager, enrichmentService: EnrichmentService) {
         self.monitor = monitor
@@ -35,6 +39,11 @@ class MenuBarManager: NSObject, ObservableObject, NSPopoverDelegate {
             let count = note.userInfo?["pendingCount"] as? Int ?? 0
             self?.updateIcon(pendingCount: count)
         }
+        closeObserver = NotificationCenter.default.addObserver(
+            forName: .init("NaviClosePopover"), object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.popover?.performClose(nil)
+        }
     }
 
     func disable() {
@@ -48,6 +57,10 @@ class MenuBarManager: NSObject, ObservableObject, NSPopoverDelegate {
         if let obs = eventObserver {
             NotificationCenter.default.removeObserver(obs)
             eventObserver = nil
+        }
+        if let obs = closeObserver {
+            NotificationCenter.default.removeObserver(obs)
+            closeObserver = nil
         }
     }
 
@@ -93,6 +106,13 @@ class MenuBarManager: NSObject, ObservableObject, NSPopoverDelegate {
     }
 
     private func startOutsideClickMonitor() {
+        if resignObserver == nil {
+            resignObserver = NotificationCenter.default.addObserver(
+                forName: NSApplication.didResignActiveNotification, object: nil, queue: .main
+            ) { [weak self] _ in
+                self?.popover?.performClose(nil)
+            }
+        }
         guard outsideClickMonitor == nil else { return }
         outsideClickMonitor = NSEvent.addGlobalMonitorForEvents(
             matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]
@@ -102,6 +122,10 @@ class MenuBarManager: NSObject, ObservableObject, NSPopoverDelegate {
     }
 
     private func stopOutsideClickMonitor() {
+        if let o = resignObserver {
+            NotificationCenter.default.removeObserver(o)
+            resignObserver = nil
+        }
         if let m = outsideClickMonitor {
             NSEvent.removeMonitor(m)
             outsideClickMonitor = nil
