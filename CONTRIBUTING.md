@@ -44,6 +44,7 @@ Run unit tests with `swift test`. Tests live in `Tests/NaviCoreTests/` and exerc
 | `hooks/hooks.json` | Registers Claude Code hooks (loaded at session start) |
 | `hooks/hook.sh` | Main hook entrypoint for PermissionRequest, Stop, StopFailure, Notification, PostToolUse, PostToolUseFailure |
 | `hooks/pretooluse.sh` | Lightweight PreToolUse hook — captures `tool_use_id` for auto-dismiss |
+| `Tests/hooks/test_headless.sh` | Headless hook tests, run in Docker by `scripts/test-hooks-linux.sh` |
 | `hooks/parse_event.py` | Parses hook payload JSON, writes event/resolve files to `/tmp/navi/events/` |
 | `docs/EXTENSION_API.md` | Public contract for external info-event producers — schema, atomicity rules, security constraints |
 | `build.sh` | Hook-time install entrypoint: fetches the published release for the version in `plugin.json`, verifies checksums.txt + Sigstore attestation, extracts `Navi.app` |
@@ -68,6 +69,18 @@ read concrete service state (`gitInfoByCwd`, etc.) directly.
 4. `Navi.app` watches the events directory (kqueue + fallback poll) and displays the event
 
 See the diagram in the [README](README.md#how-it-works) for the full set of hook-to-script mappings.
+
+### Headless hooks (Linux servers)
+
+On a non-macOS host, or when `NAVI_HEADLESS=1` is set, `hook.sh` runs in
+headless mode: it never runs `build.sh` or launches `Navi.app`, it only writes
+event files. It also refuses to use a `/tmp/navi` that is a symlink or owned by
+another user (`/tmp` is shared on multi-user servers, and `responses/` is
+trusted unconditionally). `PermissionRequest` only waits for a response while a
+relay is attached, i.e. `/tmp/navi/relay.alive` holds an epoch timestamp no
+older than 10 seconds; otherwise the hook returns no decision immediately and
+Claude Code shows its normal prompt. Test with `scripts/test-hooks-linux.sh`
+(runs `Tests/hooks/test_headless.sh` in a throwaway Docker container).
 
 ### Feature Flag System
 
