@@ -136,7 +136,8 @@ public class EventMonitor: ObservableObject, RemoteEventSink {
 
             let event = EventMonitor.makeEvent(from: dict, fallbackID: eventID, origin: "")
             DispatchQueue.main.async { self.receive(event) }
-            if event.type != "stop" { newEventTypes.insert(event.type) }
+            // Stop included: it plays only if "Finished" is on in Settings → Sounds.
+            newEventTypes.insert(event.type)
             try? fm.removeItem(atPath: path)
         }
 
@@ -354,11 +355,19 @@ public class EventMonitor: ObservableObject, RemoteEventSink {
     private func playSounds(for types: Set<String>) {
         // Check each type independently
         for type in types {
-            if UserDefaults.standard.object(forKey: "NaviSound.\(type)") as? Bool ?? (type == "permission") {
-                let name = UserDefaults.standard.string(forKey: "NaviSound.\(type).name") ?? "Glass"
+            if let name = EventMonitor.soundName(for: type) {
                 NSSound(named: NSSound.Name(name))?.play()
             }
         }
+    }
+
+    /// Which system sound to play for an event type, or nil for none. Per-type
+    /// toggles live in Settings → Sounds (`NaviSound.<type>`); only permission
+    /// is on by default. Stop ("Finished") plays only when the user turned it
+    /// on — the turn ending (working → idle) is the moment it marks.
+    static func soundName(for type: String, defaults: UserDefaults = .standard) -> String? {
+        guard defaults.object(forKey: "NaviSound.\(type)") as? Bool ?? (type == "permission") else { return nil }
+        return defaults.string(forKey: "NaviSound.\(type).name") ?? "Glass"
     }
 
     private func updateSession(for event: NaviEvent) {
@@ -423,7 +432,7 @@ public class EventMonitor: ObservableObject, RemoteEventSink {
         DispatchQueue.main.async {
             guard self.knownRemoteIDs.insert("\(origin)/\(id)").inserted else { return }
             self.receive(event)
-            if event.type != "stop" { self.playSounds(for: [event.type]) }
+            self.playSounds(for: [event.type])
         }
     }
 
