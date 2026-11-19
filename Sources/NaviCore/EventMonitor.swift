@@ -20,6 +20,8 @@ public class EventMonitor: ObservableObject, RemoteEventSink {
     /// Sessions the user dismissed (✕) while they were still alive. Discovery
     /// and heartbeats skip them; new activity (an event or a new turn) brings
     /// them back, and the entry is dropped once the session ends.
+    /// Conversation titles for local sessions (remote ones come from the relay).
+    private let localTitles = TranscriptTitleCache()
     private(set) var dismissed = Set<SessionKey>() {
         didSet { if dismissed != oldValue { saveDismissed() } }
     }
@@ -221,10 +223,16 @@ public class EventMonitor: ObservableObject, RemoteEventSink {
                   // This is the identity check that defeats PID reuse: the
                   // session id is recorded as live only when *its own* file
                   // points at a live PID.
-                  let d = DiscoveredSession.parse(dict, isAlive: { kill($0, 0) == 0 })
+                  let parsed = DiscoveredSession.parse(dict, isAlive: { kill($0, 0) == 0 })
             else { continue }
-            discovered.append(d)
+            // Title only for live sessions: dead ones are about to be pruned.
+            let title = parsed.alive ? localTitles.title(sessionID: parsed.sessionID, cwd: parsed.cwd) : ""
+            discovered.append(DiscoveredSession(
+                sessionID: parsed.sessionID, pid: parsed.pid, alive: parsed.alive, cwd: parsed.cwd,
+                name: parsed.name, claudeStatus: parsed.claudeStatus,
+                statusUpdatedAt: parsed.statusUpdatedAt, title: title))
         }
+        localTitles.forget(except: Set(discovered.filter(\.alive).map(\.sessionID)))
         let added = SessionReconciler.merge(
             discovered, origin: "", into: &sessions,
             ttyLookup: EventMonitor.lookupTTY, skip: dismissed)
@@ -419,7 +427,10 @@ public class EventMonitor: ObservableObject, RemoteEventSink {
                 shortSession: event.shortSession,
                 cwd: event.cwd,
                 tty: event.tty,
-                // Remote names come from heartbeats (see SessionReconciler.merge).
+                // Names come from the session registry (local discovery or
+                // remote heartbeat, see SessionReconciler.merge), which replaces
+                // this within a poll. Remote events may come from older hooks
+                // carrying placeholder ("derived") names, so start those blank.
                 sessionName: event.origin.isEmpty ? event.sessionName : "",
                 pid: event.pid,
                 lastActivity: event.timestamp,
@@ -441,11 +452,8 @@ public class EventMonitor: ObservableObject, RemoteEventSink {
             if !event.tty.isEmpty {
                 sessions[sid]!.tty = event.tty
             }
-            // Always update session name — it can change via /rename. Remote
-            // names come from heartbeats instead (see SessionReconciler.merge).
-            if event.origin.isEmpty {
-                sessions[sid]!.sessionName = event.sessionName
-            }
+            // Session names (incl. /rename) are refreshed from the session
+            // registry by SessionReconciler.merge, not from events.
         }
         if let info = sessions[sid], info.isLocal {
             enrichmentService?.refresh(for: info)

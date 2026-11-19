@@ -100,9 +100,9 @@ public enum SessionReconciler {
                 sessions[key]!.statusUpdatedAt = d.statusUpdatedAt
                 // Titles evolve (AI title arrives after the first exchange, /rename).
                 if !d.title.isEmpty { sessions[key]!.title = d.title }
-                // Remote: the heartbeat is the authority for the name (events
-                // from older hooks on the server may carry placeholder names).
-                if !origin.isEmpty { sessions[key]!.sessionName = d.name }
+                // The registry (session file / heartbeat) is the authority for
+                // the name, so /rename shows up and placeholder names don't.
+                sessions[key]!.sessionName = d.name
                 if d.alive, let pid = d.pid, sessions[key]!.pid != pid {
                     sessions[key]!.pid = pid
                 }
