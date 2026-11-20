@@ -39,12 +39,12 @@ struct ContentView: View {
     ]
 
     private var sessionGroups: [SessionGroup] {
-        let eventsBySession = Dictionary(grouping: monitor.events) { $0.sessionID }
+        let eventsBySession = Dictionary(grouping: monitor.events) { $0.sessionKey }
         return monitor.sessions.values.map { info in
             SessionGroup(
-                id: info.id,
+                id: info.key.id,
                 info: info,
-                events: eventsBySession[info.id] ?? []
+                events: eventsBySession[info.key] ?? []
             )
         }
         .sorted { a, b in
@@ -158,6 +158,9 @@ struct ContentView: View {
                 .help("Show floating window / bring to front")
             }
             Spacer()
+            if !monitor.hiddenSessions.isEmpty {
+                hiddenSessionsMenu
+            }
             if !sessionGroups.isEmpty {
                 Text("\(sessionGroups.count) session\(sessionGroups.count == 1 ? "" : "s")")
                     .font(.system(size: 11))
@@ -177,6 +180,36 @@ struct ContentView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 4)
+    }
+
+    /// Sessions hidden with ✕: pick one to show it again.
+    private var hiddenSessionsMenu: some View {
+        let hidden = monitor.hiddenSessions
+        let multiHost = Set(hidden.map(\.key.origin)).count > 1 || hidden.contains { !$0.key.isLocal }
+        return Menu {
+            Section("Hidden sessions") {
+                ForEach(hidden) { h in
+                    Button {
+                        monitor.unhide(h.key)
+                    } label: {
+                        Text(multiHost ? "\(h.label) — \(h.hostLabel)" : h.label)
+                    }
+                }
+            }
+            Divider()
+            Button("Show all") { monitor.unhideAll() }
+        } label: {
+            HStack(spacing: 2) {
+                Image(systemName: "eye.slash")
+                Text("\(hidden.count)")
+            }
+            .font(.system(size: 11))
+            .foregroundStyle(.secondary)
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Hidden sessions: choose one to show it again")
     }
 
     @State private var settingsTab = 0
@@ -250,6 +283,8 @@ struct ContentView: View {
                     settingsRow("Floating window", subtitle: "Always-on-top floating window.",
                         isOn: Binding(get: { floatingManager.isFloating }, set: { floatingManager.isFloating = $0 }), indent: true)
                 }
+                settingsRow("Highlight finished sessions", subtitle: "Pulse a session after it finishes responding until you click it.",
+                    isOn: Binding(get: { floatingManager.highlightFinishedEnabled }, set: { floatingManager.highlightFinishedEnabled = $0 }))
                 settingsRow("Session names", subtitle: "Show the session name (from /rename) instead of the project folder.",
                     isOn: Binding(get: { floatingManager.sessionNamesEnabled }, set: { floatingManager.sessionNamesEnabled = $0 }))
                 settingsRow("Permission details", subtitle: "Show a \"Show details\" button on permission requests with the full tool input.",
@@ -403,6 +438,12 @@ struct ContentView: View {
                 contextAlertThresholdPicker
             }
 
+            settingsRow("Remote hosts",
+                subtitle: "Monitor and answer permission requests for Claude Code sessions on your own servers over SSH.",
+                isOn: Binding(get: { floatingManager.remoteHostsEnabled }, set: { floatingManager.remoteHostsEnabled = $0 }))
+            Button("Manage remote hosts…") { RemoteHostsWindow.shared.show() }
+                .controlSize(.small)
+
             Spacer()
         }
         .padding(12)
@@ -514,12 +555,90 @@ struct ContentView: View {
         .frame(maxWidth: .infinity, minHeight: 60)
     }
 
+    /// Collapsed host groups, persisted as a newline-separated list of ids.
+    @AppStorage("Navi.CollapsedHosts") private var collapsedHostsRaw: String = ""
+    private var collapsedHosts: Set<String> { Set(collapsedHostsRaw.split(separator: "\n").map(String.init)) }
+    private func toggleCollapsed(_ id: String) {
+        var set = collapsedHosts
+        if set.contains(id) { set.remove(id) } else { set.insert(id) }
+        collapsedHostsRaw = set.sorted().joined(separator: "\n")
+    }
+
     private var sessionList: some View {
-        VStack(spacing: 6) {
-            ForEach(sessionGroups) { group in
-                SessionSection(group: group, monitor: monitor, floatingManager: floatingManager, enrichmentService: enrichmentService)
+        let groups = sessionGroups
+        return VStack(spacing: 6) {
+            if HostGroup.shouldGroup(groups) {
+                // Sessions span remote hosts: one collapsible header per host,
+                // the host with the latest activity on top.
+                ForEach(HostGroup.make(from: groups)) { host in
+                    let collapsed = collapsedHosts.contains(host.id)
+                    HostHeader(host: host, collapsed: collapsed) {
+                        withAnimation(.easeInOut(duration: 0.2)) { toggleCollapsed(host.id) }
+                    }
+                    ForEach(collapsed ? host.collapsedSessions : host.sessions) { group in
+                        SessionSection(group: group, monitor: monitor, floatingManager: floatingManager, enrichmentService: enrichmentService)
+                    }
+                }
+            } else {
+                ForEach(groups) { group in
+                    SessionSection(group: group, monitor: monitor, floatingManager: floatingManager, enrichmentService: enrichmentService)
+                }
             }
         }
         .padding(.vertical, 6)
+    }
+}
+
+/// Header above one host's sessions: name, session count, attention and
+/// connection state. Click to collapse; a collapsed host still shows any
+/// session waiting for a permission decision.
+private struct HostHeader: View {
+    let host: HostGroup
+    let collapsed: Bool
+    let toggle: () -> Void
+    @AppStorage("NaviFontScale") private var s: Double = 1.0
+
+    var body: some View {
+        Button(action: toggle) {
+            HStack(spacing: 6) {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 9 * s, weight: .bold))
+                    .foregroundStyle(.tertiary)
+                    .rotationEffect(.degrees(collapsed ? 0 : 90))
+                Image(systemName: host.isLocal ? "laptopcomputer" : "server.rack")
+                    .font(.system(size: 11 * s))
+                    .foregroundStyle(.secondary)
+                Text(host.title)
+                    .font(.system(size: 12 * s, weight: .semibold))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text("\(host.sessions.count)")
+                    .font(.system(size: 10 * s, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 5)
+                    .background(Capsule().fill(Color.secondary.opacity(0.15)))
+                if host.pendingCount > 0 {
+                    Label("\(host.pendingCount)", systemImage: "exclamationmark.circle.fill")
+                        .font(.system(size: 10 * s, weight: .medium))
+                        .foregroundStyle(.orange)
+                }
+                if host.isDisconnected {
+                    Label("Disconnected", systemImage: "wifi.slash")
+                        .font(.system(size: 10 * s))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                TimelineView(.periodic(from: .now, by: 1)) { context in
+                    Text(relativeTime(from: host.lastActivity, to: context.date))
+                        .font(.system(size: 10 * s))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.top, 4)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(collapsed ? "Show sessions on \(host.title)" : "Hide sessions on \(host.title)")
     }
 }

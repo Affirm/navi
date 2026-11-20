@@ -30,8 +30,33 @@ struct SessionSection: View {
     @State private var isExpanded = false
     @AppStorage("NaviFontScale") private var s: Double = 1.0
 
+    /// Finished and not yet clicked: pulse until acknowledged.
+    private var highlightFinished: Bool {
+        floatingManager.highlightFinishedEnabled && group.info.finishedUnseen && !group.hasPending
+    }
+
     private var shouldExpand: Bool {
         group.hasPending || group.events.contains { $0.type == "info" && !$0.resolved }
+    }
+
+    private func openConversation() {
+        monitor.acknowledge(group.info.key)
+        let info = group.info
+        DispatchQueue.global(qos: .userInitiated).async {
+            let url = ConversationLink.url(for: info)
+            DispatchQueue.main.async {
+                if let url {
+                    // Close the tray popover now; the app hand-off doesn't
+                    // always take focus from Navi.
+                    NotificationCenter.default.post(name: .init("NaviClosePopover"), object: nil)
+                    NSWorkspace.shared.open(url)
+                } else if info.isLocal && (!info.tty.isEmpty || info.pid > 0) {
+                    focusTerminal(tty: info.tty, pid: info.pid)
+                } else {
+                    NSSound.beep()
+                }
+            }
+        }
     }
 
     var body: some View {
@@ -39,21 +64,27 @@ struct SessionSection: View {
             // Session header
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 0) {
-                    Button { withAnimation(.easeInOut(duration: 0.2)) { isExpanded.toggle() } } label: {
+                    Button {
+                        monitor.acknowledge(group.info.key)
+                        withAnimation(.easeInOut(duration: 0.2)) { isExpanded.toggle() }
+                    } label: {
                         HStack(spacing: 6) {
                             Image(systemName: group.status.icon)
                                 .foregroundStyle(group.status.color)
                                 .font(.system(size: 13 * s))
+                                .symbolEffect(.pulse, options: .repeating, isActive: highlightFinished)
 
                             Image(systemName: "folder.fill")
                                 .foregroundStyle(.secondary)
                                 .font(.system(size: 11 * s))
+                            // The session ID is only useful for debugging: keep it in
+                            // the tooltip instead of spending row width on it.
                             Text(group.info.displayName(useSessionName: floatingManager.sessionNamesEnabled))
                                 .font(.system(size: 13 * s, weight: .semibold))
-
-                            Text(group.info.shortSession)
-                                .font(.system(size: 11 * s, design: .monospaced))
-                                .foregroundStyle(.tertiary)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                                // Full name (rows truncate long ones) plus the session ID.
+                                .help("\(group.info.displayName(useSessionName: floatingManager.sessionNamesEnabled))\nSession \(group.info.id)\nDouble-click to open the conversation")
 
                             Spacer()
 
@@ -78,11 +109,22 @@ struct SessionSection: View {
                         }
                         .padding(.horizontal, 10)
                         .padding(.vertical, 6)
+                        // Whole row is clickable, not just the text and icons
+                        // (a plain button only hit-tests drawn content).
+                        .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
+                    // Double-click: open the conversation where it runs (Claude
+                    // app / VS Code), else focus its terminal.
+                    .simultaneousGesture(TapGesture(count: 2).onEnded { openConversation() })
 
-                    if !group.info.tty.isEmpty || group.info.pid > 0 {
-                        Button { focusTerminal(tty: group.info.tty, pid: group.info.pid) } label: {
+                    // Remote sessions run on another machine: their tty/pid
+                    // mean nothing here, so never try to focus a local terminal.
+                    if group.info.isLocal && (!group.info.tty.isEmpty || group.info.pid > 0) {
+                        Button {
+                            monitor.acknowledge(group.info.key)
+                            focusTerminal(tty: group.info.tty, pid: group.info.pid)
+                        } label: {
                             Image(systemName: "terminal.fill")
                                 .font(.system(size: 10 * s, weight: .bold))
                                 .foregroundStyle(.secondary)
@@ -92,7 +134,7 @@ struct SessionSection: View {
                         .padding(.trailing, 6)
                     }
 
-                    Button { monitor.dismissSession(group.id) } label: {
+                    Button { monitor.dismissSession(group.info.key) } label: {
                         Image(systemName: "xmark")
                             .font(.system(size: 10 * s, weight: .bold))
                             .foregroundStyle(.tertiary)
@@ -233,6 +275,7 @@ struct SessionSection: View {
             RoundedRectangle(cornerRadius: 7)
                 .stroke(group.hasPending ? Color.orange.opacity(0.2) : Color.gray.opacity(0.2), lineWidth: 0.5)
         )
+        .modifier(FinishedPulse(active: highlightFinished))
         .padding(.horizontal, 6)
         .onAppear {
             if shouldExpand { isExpanded = true }
@@ -344,5 +387,34 @@ struct SessionSection: View {
         .padding(.vertical, 2)
         .opacity(sub.isRunning ? 1 : 0.55)
         .help(sub.description.isEmpty ? sub.agentType : "\(sub.agentType): \(sub.description)")
+    }
+}
+
+/// Breathing green glow on a session card whose turn just ended, shown until
+/// the user clicks the session (see `SessionInfo.finishedUnseen`).
+private struct FinishedPulse: ViewModifier {
+    let active: Bool
+    @State private var bright = false
+
+    func body(content: Content) -> some View {
+        content
+            .background(
+                RoundedRectangle(cornerRadius: 7)
+                    .fill(Color.green.opacity(active ? (bright ? 0.14 : 0.03) : 0))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 7)
+                    .stroke(Color.green.opacity(active ? (bright ? 0.8 : 0.2) : 0), lineWidth: 1.2)
+            )
+            .onAppear { update(active) }
+            .onChange(of: active) { _, on in update(on) }
+    }
+
+    private func update(_ on: Bool) {
+        if on {
+            withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) { bright = true }
+        } else {
+            withAnimation(.easeOut(duration: 0.2)) { bright = false }
+        }
     }
 }

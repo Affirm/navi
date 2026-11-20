@@ -38,12 +38,17 @@ Run unit tests with `swift test`. Tests live in `Tests/NaviCoreTests/` and exerc
 | Path | Purpose |
 |------|---------|
 | `Package.swift` | SPM manifest: `NaviCore` library, `Navi` executable, `NaviCoreTests` test target |
-| `Sources/NaviCore/` | Library: models (`NaviEvent`, `SessionInfo`, `SessionGroup`, `SessionStatus`, `GitInfo`, `TranscriptInfo`, `PRInfo`, `SubagentInfo`), `EventMonitor`, `FeatureFlags`, helpers (`relativeTime`, `focusTerminal`, `naviLog`), `naviCurrentVersion`, `SessionEnrichmentProvider` protocol |
+| `Sources/NaviCore/` | Library: models (`NaviEvent`, `SessionInfo`, `SessionGroup`, `SessionStatus`, `GitInfo`, `TranscriptInfo`, `PRInfo`, `SubagentInfo`), `SessionKey`, `EventMonitor`, `SessionLiveness` (`OriginLiveness`, `DiscoveredSession`, `SessionReconciler`), `FeatureFlags`, helpers (`relativeTime`, `focusTerminal`, `naviLog`), `naviCurrentVersion`, `SessionEnrichmentProvider` protocol |
 | `Sources/Navi/` | Executable: `@main` + `NaviAppDelegate`, `FloatingWindowManager`, `MenuBarManager`, `EnrichmentService` (conforms to `SessionEnrichmentProvider`), pastel palette, SwiftUI views (`ContentView`, `SessionSection`, `EventRow`, `WindowAccessor`, `FlowLayout`) |
 | `Tests/NaviCoreTests/` | Swift Testing suites for `NaviCore` |
 | `hooks/hooks.json` | Registers Claude Code hooks (loaded at session start) |
 | `hooks/hook.sh` | Main hook entrypoint for PermissionRequest, Stop, StopFailure, Notification, PostToolUse, PostToolUseFailure |
 | `hooks/pretooluse.sh` | Lightweight PreToolUse hook — captures `tool_use_id` for auto-dismiss |
+| `Tests/hooks/test_headless.sh` | Headless hook tests, run in Docker by `scripts/test-hooks-linux.sh` |
+| `hooks/relay.py` | Remote-hosts relay (stdlib Python): streams a server's events/heartbeats as JSONL on stdout, writes responses read from stdin |
+| `Sources/NaviCore/RelaySource.generated.swift` | Embedded copy of `relay.py`; regenerate with `scripts/embed-relay.sh` (a test fails on drift) |
+| `Tests/relay/test_relay.py` | `relay.py` tests: `python3 -m unittest discover -s Tests/relay` |
+| `scripts/dev-remote-container.sh`, `scripts/dev-remote/` | Disposable SSH "remote host" container for local testing |
 | `hooks/parse_event.py` | Parses hook payload JSON, writes event/resolve files to `/tmp/navi/events/` |
 | `docs/EXTENSION_API.md` | Public contract for external info-event producers — schema, atomicity rules, security constraints |
 | `build.sh` | Hook-time install entrypoint: fetches the published release for the version in `plugin.json`, verifies checksums.txt + Sigstore attestation, extracts `Navi.app` |
@@ -60,6 +65,52 @@ and needs to call into the service on session updates / evictions, so
 `EventMonitor` needs to talk to the service in new ways; views in `Navi`
 read concrete service state (`gitInfoByCwd`, etc.) directly.
 
+### Session origins and liveness
+
+Every `NaviEvent` and `SessionInfo` carries an `origin`: `""` for this Mac, an
+SSH host alias for a remote host. Session IDs are never prefixed; sessions are
+keyed by `SessionKey(origin, sessionID)` and events match sessions by that key.
+Pruning is per origin via `SessionReconciler.prune` and an `OriginLiveness`
+per origin: the local PID scan of `~/.claude/sessions/` yields `.live(ids)` (or
+`.unknown` if the directory can't be read, which skips pruning); a remote host
+reports `.live(ids)` from its relay heartbeat, or `.disconnected`, which keeps
+its sessions and flags them instead of pruning. Enrichment (git, transcripts,
+PRs) and terminal focus only ever run for local sessions.
+
+### Remote hosts (experimental, flag `remote-hosts`, default OFF)
+
+Navi can monitor Claude Code sessions on the user's own servers over SSH.
+`RemoteBridge` (NaviCore) keeps one process per enabled host:
+`ssh -T -o BatchMode=yes … -- <alias> python3 -c 'import base64;exec(base64.b64decode("…"))'`.
+The relay source is the copy embedded in the app, so the server always runs
+the matching version and nothing is installed for the relay itself. stdin is
+the control channel (approve/deny lines), stdout carries JSONL events and a
+heartbeat every 3s with the host's live sessions. The relay keeps
+`/tmp/navi/relay.alive` fresh so headless `hook.sh` knows to wait for a
+decision. Security rules: transport is SSH stdio only (never a network
+port); Navi only connects to hosts the user added; aliases are validated so
+they can't be parsed as ssh options; remote event/response IDs are validated
+on both ends. Settings: `NaviExp.RemoteHostsEnabled`, host list in
+`NaviExp.RemoteHosts`, mirrored to `/tmp/navi/features/remote-hosts` as JSON.
+Tests use `LocalRelayTransport` (runs `hooks/relay.py` with a private
+`--root`) or `CommandTransport` (canned JSONL) instead of SSH. Run the hook
+and relay tests on Linux with `scripts/test-hooks-linux.sh`.
+
+UI lives in `Sources/Navi/RemoteHostsWindow.swift` (Settings → Experimental
+→ Manage remote hosts…); its logic is in NaviCore so it's testable:
+`SSHConfigParser` (Host aliases from ~/.ssh/config, following `Include`),
+`SSHEffectiveConfig` (`ssh -G`), `HostProbe` (Test connection),
+`RemoteInstall` (install/uninstall steps, `--json` outcome parsing with a
+fallback for older Claude Code, offline copy to `~/.navi/plugin`) and
+`ProcessRunner`. Every install/uninstall shows the exact commands and runs
+only after confirmation.
+
+To try it without a real server, `scripts/dev-remote-container.sh` starts a
+throwaway sshd container (python3 + this checkout's `hooks/`) and prints a
+`Host navi-dev` block for your ssh config. Inside it,
+`navi-fake-session start|permission|stop|working|end` simulates a Claude
+session without Claude Code. `scripts/dev-remote-container.sh stop` removes it.
+
 ### Event Flow
 
 1. Claude Code fires a hook event (e.g., `PermissionRequest`)
@@ -68,6 +119,18 @@ read concrete service state (`gitInfoByCwd`, etc.) directly.
 4. `Navi.app` watches the events directory (kqueue + fallback poll) and displays the event
 
 See the diagram in the [README](README.md#how-it-works) for the full set of hook-to-script mappings.
+
+### Headless hooks (Linux servers)
+
+On a non-macOS host, or when `NAVI_HEADLESS=1` is set, `hook.sh` runs in
+headless mode: it never runs `build.sh` or launches `Navi.app`, it only writes
+event files. It also refuses to use a `/tmp/navi` that is a symlink or owned by
+another user (`/tmp` is shared on multi-user servers, and `responses/` is
+trusted unconditionally). `PermissionRequest` only waits for a response while a
+relay is attached, i.e. `/tmp/navi/relay.alive` holds an epoch timestamp no
+older than 10 seconds; otherwise the hook returns no decision immediately and
+Claude Code shows its normal prompt. Test with `scripts/test-hooks-linux.sh`
+(runs `Tests/hooks/test_headless.sh` in a throwaway Docker container).
 
 ### Feature Flag System
 

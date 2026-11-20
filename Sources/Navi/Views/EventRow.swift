@@ -155,6 +155,11 @@ struct EventRow: View {
         }
     }
 
+    /// A remote card whose host is disconnected can't be answered from here.
+    private var hostDisconnected: Bool {
+        !event.origin.isEmpty && (monitor.sessions[event.sessionKey]?.isDisconnected ?? false)
+    }
+
     private var permissionButtons: some View {
         HStack(spacing: 8) {
             showDetailsButton
@@ -169,6 +174,7 @@ struct EventRow: View {
                 .buttonStyle(.bordered)
                 .tint(.red)
                 .controlSize(.small)
+                .disabled(hostDisconnected)
             Button("Approve") {
                 showingDetails = false
                 monitor.respond(to: event.id, with: "approve")
@@ -176,6 +182,8 @@ struct EventRow: View {
                 .buttonStyle(.borderedProminent)
                 .tint(.blue)
                 .controlSize(.small)
+                .disabled(hostDisconnected)
+                .help(hostDisconnected ? "\(event.origin) is disconnected — respond in its terminal" : "")
         }
         .padding(.top, 2)
     }

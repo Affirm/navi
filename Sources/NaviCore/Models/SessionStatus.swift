@@ -1,7 +1,7 @@
 import SwiftUI
 
 public enum SessionStatus: Equatable {
-    case needsAttention, working, waitingForInput, idle
+    case needsAttention, working, waitingForInput, idle, disconnected
 
     public var icon: String {
         switch self {
@@ -9,6 +9,7 @@ public enum SessionStatus: Equatable {
         case .working: return "gearshape.circle.fill"
         case .waitingForInput: return "ellipsis.circle.fill"
         case .idle: return "checkmark.circle.fill"
+        case .disconnected: return "wifi.slash"
         }
     }
 
@@ -18,6 +19,7 @@ public enum SessionStatus: Equatable {
         case .working: return .green
         case .waitingForInput: return .blue
         case .idle: return .green
+        case .disconnected: return .gray
         }
     }
 
@@ -27,6 +29,7 @@ public enum SessionStatus: Equatable {
         case .working: return "Working"
         case .waitingForInput: return "Idle"
         case .idle: return ""
+        case .disconnected: return "Disconnected"
         }
     }
 }

@@ -6,6 +6,24 @@ APP="$PLUGIN_ROOT/Navi.app"
 APP_BINARY="$APP/Contents/MacOS/Navi"
 EVENTS_DIR="/tmp/navi/events"
 RESPONSES_DIR="/tmp/navi/responses"
+
+# Headless mode: on a server without Navi.app (any non-macOS host, or when
+# NAVI_HEADLESS=1) the hook only writes event files. A relay started by the
+# Mac's Navi over SSH (hooks/relay.py) streams them back and writes
+# responses. There is no app to build or launch.
+NAVI_HEADLESS_MODE=""
+if [ "$(uname -s)" != "Darwin" ] || [ "${NAVI_HEADLESS:-}" = "1" ]; then
+    NAVI_HEADLESS_MODE=1
+    # /tmp is shared on multi-user servers. responses/ is trusted
+    # unconditionally below, so refuse to use a /tmp/navi that another user
+    # created (or that is a symlink) rather than risk a forged approval.
+    mkdir -p -m 700 /tmp/navi 2>/dev/null || true
+    if [ -L /tmp/navi ] || [ ! -O /tmp/navi ]; then
+        echo "navi: /tmp/navi is not owned by $(id -un); skipping" >&2
+        exit 0
+    fi
+fi
+
 mkdir -p "$EVENTS_DIR" "$RESPONSES_DIR"
 # Owner-only: event files hold Confidential tool input; response files are the
 # permission-decision channel that hook.sh trusts unconditionally. Chmod on
@@ -15,15 +33,29 @@ chmod 700 /tmp/navi "$EVENTS_DIR" "$RESPONSES_DIR" 2>/dev/null || true
 # Clean up stale event/response files older than 5 minutes
 find "$EVENTS_DIR" "$RESPONSES_DIR" -type f -mmin +5 -delete 2>/dev/null || true
 
-# Install if needed (build.sh fetches the release for plugin.json's version
-# and short-circuits when Navi.app's built-version marker already matches)
-bash "$PLUGIN_ROOT/build.sh" >&2
+if [ -z "$NAVI_HEADLESS_MODE" ]; then
+    # Install if needed (build.sh fetches the release for plugin.json's version
+    # and short-circuits when Navi.app's built-version marker already matches)
+    bash "$PLUGIN_ROOT/build.sh" >&2
 
-# Launch the monitor app if not running (skip if NAVI_NO_AUTO_LAUNCH is set).
-if [ -z "${NAVI_NO_AUTO_LAUNCH:-}" ] && [ ! -f "/tmp/navi/no-auto-launch" ] && ! pgrep -x Navi > /dev/null 2>&1; then
-    open "$APP" &
-    sleep 0.5
+    # Launch the monitor app if not running (skip if NAVI_NO_AUTO_LAUNCH is set).
+    if [ -z "${NAVI_NO_AUTO_LAUNCH:-}" ] && [ ! -f "/tmp/navi/no-auto-launch" ] && ! pgrep -x Navi > /dev/null 2>&1; then
+        open "$APP" &
+        sleep 0.5
+    fi
 fi
+
+# In headless mode a permission card can only be answered while a relay is
+# attached. relay.py rewrites this file with the current epoch every few
+# seconds; if it is missing or stale, nobody is listening.
+RELAY_ALIVE_FILE="/tmp/navi/relay.alive"
+relay_attached() {
+    [ -f "$RELAY_ALIVE_FILE" ] || return 1
+    local beat
+    beat=$(head -c 32 "$RELAY_ALIVE_FILE" 2>/dev/null | tr -cd '0-9')
+    [ -n "$beat" ] || return 1
+    [ $(( $(date +%s) - beat )) -le 10 ]
+}
 
 # Feature flags: hooks check /tmp/navi/features/<name> to skip work for
 # disabled experimental features.  Flag files can be empty (boolean) or
@@ -86,6 +118,12 @@ NAVI_RESPONDED=false
 
 case "$EVENT" in
     PermissionRequest)
+        # Headless with no relay attached: return no decision right away so
+        # Claude Code shows its normal prompt instead of stalling for
+        # NAVI_HOOK_TIMEOUT seconds.
+        if [ -n "$NAVI_HEADLESS_MODE" ] && ! relay_attached; then
+            exit 0
+        fi
         # Poll for response using wall clock time
         DEADLINE=$(($(date +%s) + NAVI_HOOK_TIMEOUT))
         while [ "$(date +%s)" -lt "$DEADLINE" ]; do

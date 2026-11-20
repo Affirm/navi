@@ -138,7 +138,11 @@ ppid = os.environ.get("NAVI_PPID", "")
 if ppid and ppid.isdigit():
     try:
         with open(os.path.expanduser("~/.claude/sessions/" + ppid + ".json")) as sf:
-            session_name = json.load(sf).get("name", "")
+            _sess = json.load(sf)
+            # "derived" names are placeholders Claude Code generated, not
+            # names anyone chose; let Navi fall back to its own labels.
+            if _sess.get("nameSource") != "derived":
+                session_name = _sess.get("name", "")
     except (FileNotFoundError, OSError, json.JSONDecodeError):
         pass
 

@@ -17,6 +17,9 @@ public struct NaviEvent: Identifiable {
     public let tty: String
     public let toolUseID: String
     public let expires: Date?     // when the hook times out and buttons go stale
+    /// Host the event came from: "" for this Mac, the SSH host alias for a
+    /// remote host. See `SessionKey`.
+    public let origin: String
     public var resolved = false
     public var response: String?
 
@@ -35,7 +38,8 @@ public struct NaviEvent: Identifiable {
         toolUseID: String,
         expires: Date?,
         resolved: Bool = false,
-        response: String? = nil
+        response: String? = nil,
+        origin: String = ""
     ) {
         self.id = id
         self.timestamp = timestamp
@@ -52,7 +56,10 @@ public struct NaviEvent: Identifiable {
         self.expires = expires
         self.resolved = resolved
         self.response = response
+        self.origin = origin
     }
+
+    public var sessionKey: SessionKey { SessionKey(origin: origin, sessionID: sessionID) }
 
     public var isPending: Bool { type == "permission" && !resolved }
 

@@ -2,3 +2,5 @@ Navi.app/
 .DS_Store
 .build/
 .swiftpm/
+/out/
+/.dev-remote/

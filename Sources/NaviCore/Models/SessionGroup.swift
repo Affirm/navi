@@ -14,6 +14,9 @@ public struct SessionGroup: Identifiable {
     public var hasPending: Bool { events.contains { $0.isPending } }
 
     public var status: SessionStatus {
+        // A remote host whose relay dropped: nothing shown for it can be acted
+        // on (approvals can't be delivered), so say so above everything else.
+        if !info.isLocal && info.isDisconnected { return .disconnected }
         if hasPending { return .needsAttention }
         guard info.isAlive else { return .idle }
 

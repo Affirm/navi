@@ -1,0 +1,471 @@
+"""Navi relay: runs on a remote host, speaks JSON lines over stdio.
+
+Navi (on the Mac) starts this over SSH, passing the source as an argument so
+nothing has to be installed on the server and the relay always matches the
+app version:
+
+    ssh -T -o BatchMode=yes <alias> \\
+        python3 -c 'import base64;exec(base64.b64decode("<b64 source>"))' [args]
+
+stdout (relay -> Navi), one JSON object per line:
+    {"kind":"hello","version":N,"user":...,"host":...}
+    {"kind":"event","event":{...}}          regular event file contents
+    {"kind":"resolve","resolve":{...}}      resolve-/cancel- signal
+    {"kind":"working","session_id":"..."}   UserPromptSubmit signal
+    {"kind":"heartbeat","live":[ids],"sessions":[...],"user":...,"host":...}
+    {"kind":"error","message":"..."}        fatal; the relay exits after it
+
+stdin (Navi -> relay), one JSON object per line:
+    {"kind":"response","id":"<epoch>-<32 hex>","decision":"approve|deny"}
+
+The relay exits cleanly on stdin EOF (i.e. when the SSH connection or Navi
+goes away). It never listens on a network port: the responses/ directory is
+trusted unconditionally by hook.sh, so SSH stdio is the only transport.
+
+Stdlib only; works with Python 3.6+.
+"""
+
+import argparse
+import getpass
+import json
+import os
+import re
+import signal
+import socket
+import stat
+import sys
+import tempfile
+import threading
+import time
+
+RELAY_VERSION = 1
+
+# Feature flags the relay may mirror onto the server. Only flags that change
+# what the headless hooks write are relevant; terminal-focus is meaningless on
+# a remote host and is never mirrored.
+MIRRORABLE_FEATURES = ("auto-dismiss", "session-status", "session-names")
+
+EVENT_ID_RE = re.compile(r"^[0-9]{1,20}-[0-9a-f]{32}$")
+BRIDGE_ID_RE = re.compile(r"^(?:session|cse)_[A-Za-z0-9_-]{1,100}$")
+DECISIONS = ("approve", "deny")
+MAX_EVENT_BYTES = 1024 * 1024
+STALE_EVENT_SECONDS = 120
+POLL_SECONDS = 0.3
+TITLE_MAX = 120
+PROMPT_TITLE_MAX = 70   # first-prompt fallback: a label, not the whole message
+TITLE_TAIL_BYTES = 4 * 1024 * 1024   # first read of a big transcript: tail only
+TITLE_READ_BYTES = 8 * 1024 * 1024   # max bytes read per heartbeat per transcript
+HEARTBEAT_SECONDS = 3.0
+
+_out_lock = threading.Lock()
+
+
+def emit(obj):
+    """Write one JSON line to stdout. Returns False if Navi is gone."""
+    line = json.dumps(obj, separators=(",", ":")) + "\n"
+    with _out_lock:
+        try:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            return True
+        except (BrokenPipeError, OSError, ValueError):
+            return False
+
+
+def fail(message, code=2):
+    emit({"kind": "error", "message": message})
+    sys.exit(code)
+
+
+def ensure_private_dir(path):
+    """Create path as 0700 if missing; refuse a symlink or a dir owned by
+    someone else (/tmp is shared on multi-user servers)."""
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
+    st = os.lstat(path)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        fail("{} is not a directory (symlink?); refusing to use it".format(path))
+    if st.st_uid != os.getuid():
+        fail("{} is owned by another user; refusing to use it".format(path))
+    if stat.S_IMODE(st.st_mode) != 0o700:
+        os.chmod(path, 0o700)
+
+
+def atomic_write(directory, name, data):
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix="." + name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(data)
+        os.rename(tmp, os.path.join(directory, name))
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def sync_features(features_dir, enabled):
+    for name in MIRRORABLE_FEATURES:
+        path = os.path.join(features_dir, name)
+        if name in enabled:
+            if not os.path.exists(path):
+                open(path, "a").close()
+        else:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+
+
+def looks_like_claude(pid):
+    """Guard against PID reuse: a stale ~/.claude/sessions/<pid>.json whose
+    PID now belongs to some other process would otherwise show up as a live
+    ghost session. On Linux, require "claude" in the process command line.
+    Without /proc (macOS, BSD) there's nothing to check, so accept."""
+    proc = "/proc/{}".format(pid)
+    if not os.path.isdir("/proc/self"):
+        return True
+    try:
+        with open(proc + "/cmdline", "rb") as f:
+            cmdline = f.read().replace(b"\0", b" ").lower()
+    except OSError:
+        return False  # gone, or not ours to read
+    return b"claude" in cmdline
+
+
+def _clean_title(text):
+    text = " ".join(text.split())
+    return text[:TITLE_MAX]
+
+
+def _first_prompt(d):
+    """Text of a real user prompt line, or "" (tool results, meta, commands)."""
+    if (d.get("type") != "user" or d.get("isMeta") or d.get("isSidechain")
+            or d.get("isCompactSummary")):
+        return ""
+    msg = d.get("message")
+    content = msg.get("content") if isinstance(msg, dict) else None
+    if isinstance(content, list):
+        content = " ".join(x.get("text", "") for x in content
+                           if isinstance(x, dict) and x.get("type") == "text"
+                           and isinstance(x.get("text"), str))
+    if not isinstance(content, str):
+        return ""
+    content = " ".join(content.split())
+    if not content or content.startswith("<") or content.startswith("This session is being continued"):
+        return ""
+    if len(content) > PROMPT_TITLE_MAX:
+        content = content[:PROMPT_TITLE_MAX - 1].rstrip() + "\u2026"
+    return content
+
+
+class TitleCache:
+    """Conversation titles from transcripts in ~/.claude/projects/.
+
+    Claude Code appends {"type":"custom-title","customTitle":...} (/rename)
+    and {"type":"ai-title","aiTitle":...} lines as titles change; the latest
+    of each wins, custom over ai, with the first user prompt as a fallback.
+    Transcripts are read incrementally (only new bytes per heartbeat), and
+    only titles leave the server, never conversation content beyond that.
+    """
+
+    def __init__(self, projects_dir):
+        self.projects_dir = projects_dir
+        self.state = {}
+
+    def title(self, sid, cwd):
+        st = self.state.get(sid)
+        if st is None or not os.path.isfile(st["path"]):
+            path = self._find(sid, cwd)
+            if path is None:
+                return ""
+            st = {"path": path, "offset": 0, "custom": "", "ai": "", "first": "",
+                  "partial": b"", "skip_line": False}
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                return ""
+            if size > TITLE_TAIL_BYTES:
+                st["offset"] = size - TITLE_TAIL_BYTES
+                st["skip_line"] = True  # probably starts mid-line
+            self.state[sid] = st
+        try:
+            self._read_new(st)
+        except OSError:
+            pass
+        return st["custom"] or st["ai"] or st["first"]
+
+    def forget_except(self, live_sids):
+        for sid in list(self.state):
+            if sid not in live_sids:
+                del self.state[sid]
+
+    def _find(self, sid, cwd):
+        name = sid + ".jsonl"
+        if cwd:
+            direct = os.path.join(self.projects_dir, re.sub(r"[/.]", "-", cwd), name)
+            if os.path.isfile(direct):
+                return direct
+        try:
+            dirs = os.listdir(self.projects_dir)
+        except OSError:
+            return None
+        for d in dirs:
+            p = os.path.join(self.projects_dir, d, name)
+            if os.path.isfile(p):
+                return p
+        return None
+
+    def _read_new(self, st):
+        size = os.path.getsize(st["path"])
+        if size < st["offset"]:  # truncated/rewritten: start over
+            st.update(offset=0, custom="", ai="", first="", partial=b"", skip_line=False)
+        if size == st["offset"]:
+            return
+        with open(st["path"], "rb") as f:
+            f.seek(st["offset"])
+            data = f.read(min(size - st["offset"], TITLE_READ_BYTES))
+        st["offset"] += len(data)
+        lines = (st["partial"] + data).split(b"\n")
+        st["partial"] = lines.pop()
+        if len(st["partial"]) > TITLE_READ_BYTES:
+            st["partial"] = b""
+        if st["skip_line"] and lines:
+            lines = lines[1:]
+            st["skip_line"] = False
+        for line in lines:
+            want_first = not st["first"] and b'"user"' in line
+            if b'"custom-title"' not in line and b'"ai-title"' not in line and not want_first:
+                continue
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(d, dict):
+                continue
+            t = d.get("type")
+            if t == "custom-title" and isinstance(d.get("customTitle"), str):
+                st["custom"] = _clean_title(d["customTitle"])
+            elif t == "ai-title" and isinstance(d.get("aiTitle"), str):
+                st["ai"] = _clean_title(d["aiTitle"])
+            elif want_first:
+                st["first"] = _first_prompt(d)
+
+
+def scan_sessions(sessions_dir, is_claude=looks_like_claude, titles=None):
+    """Live Claude sessions from ~/.claude/sessions/*.json (pid must be running)."""
+    live = []
+    try:
+        names = os.listdir(sessions_dir)
+    except FileNotFoundError:
+        return live  # Claude Code hasn't run here yet: no sessions
+    except OSError:
+        return None  # unknown; Navi skips pruning rather than wiping
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(sessions_dir, name)) as f:
+                d = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(d, dict):
+            continue
+        sid = d.get("sessionId")
+        pid = d.get("pid")
+        if not isinstance(sid, str) or not sid or not isinstance(pid, int) or pid <= 0:
+            continue
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            pass  # exists, owned by someone else
+        if not is_claude(pid):
+            continue
+        entry = {"sessionId": sid, "pid": pid}
+        for key in ("cwd", "name", "status"):
+            if isinstance(d.get(key), str):
+                entry[key] = d[key]
+        # nameSource "derived" = a placeholder Claude Code generated (e.g.
+        # "<folder>-84" for Remote Control sessions), not a name anyone chose.
+        # Don't let it outrank the conversation title; keep it as a fallback.
+        derived = entry.pop("name", "") if d.get("nameSource") == "derived" else ""
+        if isinstance(d.get("updatedAt"), (int, float)):
+            entry["updatedAt"] = d["updatedAt"]
+        # Remote Control session (claude.ai/code): lets Navi open it in the
+        # Claude app on the Mac.
+        bridge = d.get("bridgeSessionId")
+        if isinstance(bridge, str) and BRIDGE_ID_RE.match(bridge):
+            entry["bridgeSessionId"] = bridge
+        title = titles.title(sid, entry.get("cwd", "")) if titles is not None else ""
+        title = title or derived
+        if title:
+            entry["title"] = title
+        live.append(entry)
+    if titles is not None:
+        titles.forget_except({e["sessionId"] for e in live})
+    return live
+
+
+def forward_events(events_dir):
+    """Emit every complete event file, then delete it. Returns False if Navi
+    is gone."""
+    try:
+        names = sorted(os.listdir(events_dir))
+    except OSError:
+        return True
+    now = time.time()
+    for name in names:
+        if name.startswith(".") or not name.endswith(".json"):
+            continue
+        path = os.path.join(events_dir, name)
+        try:
+            st = os.lstat(path)
+            if not stat.S_ISREG(st.st_mode):
+                os.unlink(path)
+                continue
+            if now - st.st_mtime > STALE_EVENT_SECONDS or st.st_size > MAX_EVENT_BYTES:
+                os.unlink(path)
+                continue
+            with open(path) as f:
+                d = json.load(f)
+        except (OSError, ValueError):
+            # Unreadable or half-written by a non-atomic producer: drop it so
+            # it doesn't wedge the loop. Hooks always write atomically.
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            continue
+        if not isinstance(d, dict):
+            os.unlink(path)
+            continue
+        if name.startswith("resolve-") or name.startswith("cancel-"):
+            msg = {"kind": "resolve", "resolve": d}
+        elif name.startswith("working-"):
+            sid = d.get("session_id")
+            msg = {"kind": "working", "session_id": sid} if isinstance(sid, str) else None
+        else:
+            msg = {"kind": "event", "event": d}
+        if msg is not None and not emit(msg):
+            return False  # leave the file for the next relay
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    return True
+
+
+def handle_command(line, responses_dir):
+    try:
+        msg = json.loads(line)
+    except ValueError:
+        return
+    if not isinstance(msg, dict) or msg.get("kind") != "response":
+        return
+    eid = msg.get("id")
+    decision = msg.get("decision")
+    if not isinstance(eid, str) or not EVENT_ID_RE.match(eid) or decision not in DECISIONS:
+        return
+    atomic_write(responses_dir, eid, decision)
+
+
+def read_stdin(responses_dir, stop):
+    try:
+        for line in sys.stdin:
+            line = line.strip()
+            if line:
+                try:
+                    handle_command(line, responses_dir)
+                except OSError:
+                    pass
+    finally:
+        stop.set()
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(prog="navi-relay")
+    parser.add_argument("--root", default="/tmp/navi",
+                        help="Navi state dir (tests only; hooks always use /tmp/navi)")
+    parser.add_argument("--sessions-dir", default=os.path.expanduser("~/.claude/sessions"))
+    parser.add_argument("--projects-dir", default=os.path.expanduser("~/.claude/projects"))
+    parser.add_argument("--features", default="",
+                        help="comma-separated feature flags to mirror (see MIRRORABLE_FEATURES)")
+    parser.add_argument("--heartbeat", type=float, default=HEARTBEAT_SECONDS)
+    args = parser.parse_args(argv)
+
+    root = args.root
+    events_dir = os.path.join(root, "events")
+    responses_dir = os.path.join(root, "responses")
+    features_dir = os.path.join(root, "features")
+    alive_file = os.path.join(root, "relay.alive")
+
+    ensure_private_dir(root)
+    for d in (events_dir, responses_dir, features_dir):
+        ensure_private_dir(d)
+
+    enabled = {f for f in args.features.split(",") if f in MIRRORABLE_FEATURES}
+    sync_features(features_dir, enabled)
+
+    user = getpass.getuser()
+    host = socket.gethostname()
+    if not emit({"kind": "hello", "version": RELAY_VERSION, "user": user, "host": host}):
+        return 0
+
+    stop = threading.Event()
+
+    def on_signal(signum, frame):
+        stop.set()
+
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, on_signal)
+
+    reader = threading.Thread(target=read_stdin, args=(responses_dir, stop))
+    reader.daemon = True
+    reader.start()
+
+    titles = TitleCache(args.projects_dir)
+    next_beat = 0.0
+    try:
+        while not stop.is_set():
+            now = time.time()
+            if now >= next_beat:
+                next_beat = now + args.heartbeat
+                # Tell hook.sh a relay is attached (it checks freshness).
+                try:
+                    atomic_write(root, "relay.alive", str(int(now)))
+                except OSError:
+                    pass
+                sessions = scan_sessions(args.sessions_dir, titles=titles)
+                beat = {"kind": "heartbeat", "user": user, "host": host}
+                if sessions is not None:
+                    beat["live"] = [s["sessionId"] for s in sessions]
+                    beat["sessions"] = sessions
+                if not emit(beat):
+                    break
+            if not forward_events(events_dir):
+                break
+            stop.wait(POLL_SECONDS)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            os.unlink(alive_file)
+        except OSError:
+            pass
+    return 0
+
+
+if __name__ == "__main__":
+    rc = main(sys.argv[1:])
+    # The stdin reader thread may be blocked in readline(); a normal
+    # interpreter shutdown can stall on it. Cleanup is done, so flush and go.
+    try:
+        sys.stdout.flush()
+    except (OSError, ValueError):
+        pass
+    os._exit(rc)

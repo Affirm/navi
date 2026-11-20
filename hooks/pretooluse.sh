@@ -4,6 +4,11 @@
 # Gated behind the auto-dismiss feature flag.
 set -euo pipefail
 [ -f /tmp/navi/features/auto-dismiss ] || exit 0
+# Headless (non-macOS / NAVI_HEADLESS=1): /tmp may be shared with other
+# users, so only touch a /tmp/navi this user owns. See hook.sh.
+if [ "$(uname -s)" != "Darwin" ] || [ "${NAVI_HEADLESS:-}" = "1" ]; then
+    { [ -O /tmp/navi ] && [ ! -L /tmp/navi ]; } || exit 0
+fi
 mkdir -p /tmp/navi/pretooluse || true
 chmod 700 /tmp/navi /tmp/navi/pretooluse 2>/dev/null || true
 python3 -c "

@@ -2,26 +2,61 @@ import Foundation
 import Combine
 import AppKit
 
-public class EventMonitor: ObservableObject {
+public class EventMonitor: ObservableObject, RemoteEventSink {
     @Published public var events: [NaviEvent] = []
-    @Published public var sessions: [String: SessionInfo] = [:]
+    /// Sessions keyed by (origin, sessionID). See `SessionKey`.
+    @Published public var sessions: [SessionKey: SessionInfo] = [:]
     @Published public var needsBinaryRestart = false
 
-    private let eventsDir = "/tmp/navi/events"
-    private let responsesDir = "/tmp/navi/responses"
+    private let stateDir: String
+    private let eventsDir: String
+    private let responsesDir: String
     private var knownIDs = Set<String>()
     private var timer: Timer?
     private var dirSource: DispatchSourceFileSystemObject?
+    /// Liveness reported by remote origins (keyed by host alias). The local
+    /// origin's liveness is recomputed from the PID scan on every poll.
+    private var remoteLiveness: [String: OriginLiveness] = [:]
+    /// Conversation titles for local sessions (remote ones come from the relay).
+    private let localTitles = TranscriptTitleCache()
+    /// Sessions the user dismissed (✕) while they were still alive. Discovery
+    /// and heartbeats skip them; any update (an event, a new turn, a status
+    /// change in the registry) brings them back, and the entry is dropped
+    /// once the session ends.
+    @Published public private(set) var dismissed: [SessionKey: SessionReconciler.Dismissal] = [:] {
+        didSet { if dismissed != oldValue { saveDismissed() } }
+    }
+    /// Where dismissals persist across restarts (nil = don't persist).
+    private let dismissedStore: UserDefaults?
+    static let dismissedKey = "Navi.DismissedSessions"
     public weak var enrichmentService: (any SessionEnrichmentProvider)?
+    /// Delivers approve/deny for permission cards from remote origins.
+    public weak var remoteResponder: (any RemoteResponder)?
+    /// Event IDs already ingested from remote origins ("origin/id").
+    private var knownRemoteIDs = Set<String>()
 
     public func attach(enrichmentService: any SessionEnrichmentProvider) {
         self.enrichmentService = enrichmentService
-        for info in sessions.values {
+        for info in sessions.values where info.isLocal {
             enrichmentService.refresh(for: info)
         }
     }
 
-    public init() {
+    public convenience init() {
+        self.init(stateDir: "/tmp/navi", watch: true, dismissedStore: .standard)
+    }
+
+    /// `watch: false` (tests) skips cleanup, session discovery and the
+    /// directory watchers, so an instance never touches the live /tmp/navi.
+    init(stateDir: String, watch: Bool, dismissedStore: UserDefaults? = nil) {
+        self.stateDir = stateDir
+        self.eventsDir = "\(stateDir)/events"
+        self.responsesDir = "\(stateDir)/responses"
+        self.dismissedStore = dismissedStore
+        // Sessions hidden with ✕ stay hidden after a restart until they do
+        // something new (or end, which drops the entry on the first poll).
+        self.dismissed = EventMonitor.loadDismissed(from: dismissedStore)
+        guard watch else { return }
         let fm = FileManager.default
         let ownerOnly: [FileAttributeKey: Any] = [.posixPermissions: 0o700]
         try? fm.createDirectory(atPath: eventsDir, withIntermediateDirectories: true, attributes: ownerOnly)
@@ -29,13 +64,13 @@ public class EventMonitor: ObservableObject {
         // Self-heal perms on pre-existing dirs so event JSON (Confidential tool
         // input) and response files (trusted permission-decision channel) stay
         // owner-readable only.
-        try? fm.setAttributes(ownerOnly, ofItemAtPath: "/tmp/navi")
+        try? fm.setAttributes(ownerOnly, ofItemAtPath: stateDir)
         try? fm.setAttributes(ownerOnly, ofItemAtPath: eventsDir)
         try? fm.setAttributes(ownerOnly, ofItemAtPath: responsesDir)
         // Clean stale files from previous runs
         cleanDirectory(eventsDir)
         cleanDirectory(responsesDir)
-        try? fm.removeItem(atPath: "/tmp/navi/needs-restart")
+        try? fm.removeItem(atPath: "\(stateDir)/needs-restart")
 
         // Discover already-running Claude sessions from ~/.claude/sessions/
         discoverSessions()
@@ -79,7 +114,7 @@ public class EventMonitor: ObservableObject {
         guard let files = try? fm.contentsOfDirectory(atPath: eventsDir) else { return }
 
         var newEventTypes = Set<String>()
-        var workingSessions = Set<String>()
+        var workingSessions = Set<SessionKey>()
         for file in files.sorted() where file.hasSuffix(".json") {
             let path = "\(eventsDir)/\(file)"
 
@@ -88,21 +123,7 @@ public class EventMonitor: ObservableObject {
             if file.hasPrefix("resolve-") || file.hasPrefix("cancel-") {
                 if let data = fm.contents(atPath: path),
                    let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                    let tuid = dict["tool_use_id"] as? String
-                    let eid = dict["id"] as? String
-                    DispatchQueue.main.async {
-                        for i in self.events.indices where self.events[i].isPending {
-                            if (tuid != nil && !tuid!.isEmpty && self.events[i].toolUseID == tuid) ||
-                               (eid != nil && self.events[i].id == eid) {
-                                self.events[i].resolved = true
-                                self.events[i].response = "dismissed"
-                            }
-                        }
-                        // info cards are never isPending; resolve them by id directly.
-                        if let eid = eid, !eid.isEmpty {
-                            self.events.removeAll { $0.type == "info" && $0.id == eid }
-                        }
-                    }
+                    applyResolve(dict, origin: "")
                 }
                 try? fm.removeItem(atPath: path)
                 continue
@@ -114,7 +135,7 @@ public class EventMonitor: ObservableObject {
                 if let data = fm.contents(atPath: path),
                    let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                    let sid = dict["session_id"] as? String {
-                    workingSessions.insert(sid)
+                    workingSessions.insert(SessionKey(origin: "", sessionID: sid))
                 }
                 try? fm.removeItem(atPath: path)
                 continue
@@ -129,68 +150,14 @@ public class EventMonitor: ObservableObject {
             else { continue }
             knownIDs.insert(eventID)
 
-            let event = NaviEvent(
-                id: dict["id"] as? String ?? eventID,
-                timestamp: Date(
-                    timeIntervalSince1970: dict["timestamp"] as? Double
-                        ?? Date().timeIntervalSince1970),
-                type: dict["type"] as? String ?? "notification",
-                title: dict["title"] as? String ?? "Claude Code",
-                body: dict["body"] as? String ?? "",
-                description: dict["description"] as? String ?? "",
-                sessionID: dict["session_id"] as? String ?? "",
-                sessionName: dict["session_name"] as? String ?? "",
-                pid: pid_t(dict["pid"] as? Int ?? 0),
-                cwd: dict["cwd"] as? String ?? "",
-                tty: dict["tty"] as? String ?? "",
-                toolUseID: dict["tool_use_id"] as? String ?? "",
-                expires: (dict["expires"] as? Double).flatMap { $0 > 0 ? Date(timeIntervalSince1970: $0) : nil }
-            )
-            DispatchQueue.main.async {
-                self.updateSession(for: event)
-                // Skip Notification events for sessions that already have a
-                // pending Permission — the permission itself signals "needs
-                // attention", so the notification would be redundant.
-                if event.type == "notification",
-                   self.events.contains(where: { $0.sessionID == event.sessionID && $0.isPending }) {
-                    return
-                }
-                // When a Stop event arrives, immediately dismiss pending
-                // permissions for this session — the turn ended, so any
-                // unresolved permission was denied/interrupted. Other
-                // non-permission events use a 30s age threshold.
-                // Info events are passive status cards — they don't affect pending permissions.
-                if event.type != "permission" && event.type != "info" {
-                    let minAge: TimeInterval = event.type == "stop" ? 0 : 30
-                    for i in self.events.indices where self.events[i].sessionID == event.sessionID && self.events[i].isPending && event.timestamp.timeIntervalSince(self.events[i].timestamp) > minAge {
-                        self.events[i].resolved = true
-                        self.events[i].response = "dismissed"
-                    }
-                }
-                // Keep only the latest event per session (preserve pending permissions and
-                // sticky info cards). Info events are additive — they don't displace the
-                // current stop/notification card, and non-info events don't displace info cards.
-                if event.type != "info" {
-                    self.events.removeAll { $0.sessionID == event.sessionID && !$0.isPending && $0.type != "info" }
-                }
-                // Stop events update session state and clear stale cards (above) but don't
-                // add a card themselves — the session header's Idle status covers it.
-                guard event.type != "stop" else { return }
-                self.events.insert(event, at: 0)
-            }
-            if event.type != "stop" { newEventTypes.insert(event.type) }
+            let event = EventMonitor.makeEvent(from: dict, fallbackID: eventID, origin: "")
+            DispatchQueue.main.async { self.receive(event) }
+            // Stop included: it plays only if "Finished" is on in Settings → Sounds.
+            newEventTypes.insert(event.type)
             try? fm.removeItem(atPath: path)
         }
 
-        // Play sounds for new events (check each type independently)
-        for type in newEventTypes {
-            if UserDefaults.standard.object(forKey: "NaviSound.\(type)") as? Bool ?? (type == "permission") {
-                let name = UserDefaults.standard.string(forKey: "NaviSound.\(type).name") ?? "Glass"
-                NSSound(named: NSSound.Name(name))?.play()
-            }
-        }
-
-
+        playSounds(for: newEventTypes)
 
         // Auto-dismiss old events and manage sessions
         let now = Date()
@@ -208,36 +175,18 @@ public class EventMonitor: ObservableObject {
             let liveSessionIDs = self.discoverSessions()
             // Apply working signals AFTER regular events and discovery so
             // they always win over stale Stop events.
-            for sid in workingSessions {
-                if self.sessions[sid] != nil {
-                    self.sessions[sid]!.lastEventType = "working"
-                    self.sessions[sid]!.lastActivity = Date()
-                }
-                // New turn — dismiss stale pending permissions
-                for i in self.events.indices where self.events[i].sessionID == sid && self.events[i].isPending {
-                    self.events[i].resolved = true
-                    self.events[i].response = "dismissed"
-                }
-            }
-            // Prune ghosts by verified identity: keep a session only when its
-            // own id is backed by a live process. Skip pruning entirely if the
-            // sessions dir couldn't be read (nil), so a transient FS error
-            // never wipes live sessions.
-            if let liveSessionIDs {
-                let before = Set(self.sessions.keys)
-                self.sessions = self.sessions.filter { $0.value.isAlive(among: liveSessionIDs) }
-                let pruned = before.subtracting(self.sessions.keys)
-                if !pruned.isEmpty {
-                    self.events.removeAll { !$0.isPending && pruned.contains($0.sessionID) }
-                    if let svc = self.enrichmentService {
-                        pruned.forEach { svc.evict(sessionID: $0) }
-                        svc.evictUnused(activeCwds: Set(self.sessions.values.map(\.cwd)))
-                    }
-                }
-            }
+            self.applyWorking(workingSessions)
+            // Prune ghosts by verified identity, per origin: local sessions
+            // must be backed by a live process (skipped entirely if the
+            // sessions dir couldn't be read, so a transient FS error never
+            // wipes live sessions); remote sessions must be in their host's
+            // last heartbeat, or are kept and flagged while it's disconnected.
+            var liveness = self.remoteLiveness
+            liveness[""] = liveSessionIDs.map { .live($0) } ?? .unknown
+            self.reconcile(liveness: liveness)
 
             // Check if build.sh rebuilt a newer version while we're running
-            let restartMarker = "/tmp/navi/needs-restart"
+            let restartMarker = "\(self.stateDir)/needs-restart"
             if !self.needsBinaryRestart && fm.fileExists(atPath: restartMarker) {
                 let newVersion = (try? String(contentsOfFile: restartMarker, encoding: .utf8)
                     .trimmingCharacters(in: .whitespacesAndNewlines)) ?? ""
@@ -247,16 +196,6 @@ public class EventMonitor: ObservableObject {
                 }
             }
         }
-    }
-
-    /// Parse Claude's `updatedAt` field (epoch milliseconds) into a Date.
-    private func parseUpdatedAt(_ any: Any?) -> Date? {
-        let ms: Double?
-        if let d = any as? Double { ms = d }
-        else if let i = any as? Int { ms = Double(i) }
-        else { ms = nil }
-        guard let ms, ms > 0 else { return nil }
-        return Date(timeIntervalSince1970: ms / 1000)
     }
 
     /// Scan ~/.claude/sessions/ for running Claude processes. Adds any session
@@ -276,76 +215,224 @@ public class EventMonitor: ObservableObject {
         let sessionsDir = NSString(string: "~/.claude/sessions").expandingTildeInPath
         let fm = FileManager.default
         guard let files = try? fm.contentsOfDirectory(atPath: sessionsDir) else { return nil }
-        var liveSessionIDs = Set<String>()
+        var discovered: [DiscoveredSession] = []
         for file in files where file.hasSuffix(".json") {
             let path = "\(sessionsDir)/\(file)"
             guard let data = fm.contents(atPath: path),
                   let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let sid = dict["sessionId"] as? String
+                  // A session is live only if its file names a running process.
+                  // This is the identity check that defeats PID reuse: the
+                  // session id is recorded as live only when *its own* file
+                  // points at a live PID.
+                  let parsed = DiscoveredSession.parse(dict, isAlive: { kill($0, 0) == 0 })
             else { continue }
+            // Title only for live sessions: dead ones are about to be pruned.
+            let title = parsed.alive ? localTitles.title(sessionID: parsed.sessionID, cwd: parsed.cwd) : ""
+            discovered.append(DiscoveredSession(
+                sessionID: parsed.sessionID, pid: parsed.pid, alive: parsed.alive, cwd: parsed.cwd,
+                name: parsed.name, claudeStatus: parsed.claudeStatus,
+                statusUpdatedAt: parsed.statusUpdatedAt, title: title,
+                remoteControlID: parsed.remoteControlID))
+        }
+        localTitles.forget(except: Set(discovered.filter(\.alive).map(\.sessionID)))
+        SessionReconciler.wakeDismissed(&dismissed, discovered: discovered, origin: "", trustClock: true)
+        let added = SessionReconciler.merge(
+            discovered, origin: "", into: &sessions,
+            ttyLookup: EventMonitor.lookupTTY, skip: Set(dismissed.keys))
+        for key in added {
+            if let info = sessions[key] { enrichmentService?.refresh(for: info) }
+        }
+        return Set(discovered.filter(\.alive).map(\.sessionID))
+    }
 
-            let claudeStatus = dict["status"] as? String ?? ""
-            let statusUpdatedAt = parseUpdatedAt(dict["updatedAt"])
-            // A session is live only if its file names a running process. This
-            // is the identity check that defeats PID reuse: the session id is
-            // recorded as live only when *its own* file points at a live PID.
-            let filePid = dict["pid"] as? Int
-            let alive = filePid.map { kill(pid_t($0), 0) == 0 } ?? false
-            if alive { liveSessionIDs.insert(sid) }
+    /// Stored as "origin\tsessionID\tdismissedAt" strings ("" origin = this
+    /// Mac, time in epoch seconds). Entries without a time (older builds)
+    /// count as dismissed at load time.
+    static func loadDismissed(from store: UserDefaults?, now: Date = Date()) -> [SessionKey: SessionReconciler.Dismissal] {
+        let raw = store?.stringArray(forKey: dismissedKey) ?? []
+        var out: [SessionKey: SessionReconciler.Dismissal] = [:]
+        for entry in raw {
+            let parts = entry.split(separator: "\t", maxSplits: 2, omittingEmptySubsequences: false).map(String.init)
+            guard parts.count >= 2, RemoteMessage.isValidSessionID(parts[1]) else { continue }
+            let at = parts.count == 3 ? Double(parts[2].prefix { $0 != "\t" }).map { Date(timeIntervalSince1970: $0) } : nil
+            let name = parts.count == 3 ? parts[2].split(separator: "\t", maxSplits: 1).dropFirst().first.map(String.init) ?? "" : ""
+            out[SessionKey(origin: parts[0], sessionID: parts[1])] = .init(at: at ?? now, name: String(name.prefix(200)))
+        }
+        return out
+    }
 
-            // Already tracked: refresh the canonical status fields, and refresh
-            // the PID if a resume moved this session id to a new process.
-            if sessions[sid] != nil {
-                sessions[sid]!.claudeStatus = claudeStatus
-                sessions[sid]!.statusUpdatedAt = statusUpdatedAt
-                if alive, let filePid, sessions[sid]!.pid != pid_t(filePid) {
-                    sessions[sid]!.pid = pid_t(filePid)
-                }
-                continue
-            }
+    private func saveDismissed() {
+        guard let store = dismissedStore else { return }
+        let raw = dismissed.map { key, d -> String in
+            let name = d.name.components(separatedBy: .newlines).joined(separator: " ")
+                .replacingOccurrences(of: "\t", with: " ")
+            return "\(key.origin)\t\(key.sessionID)\t\(Int(d.at.timeIntervalSince1970))\t\(name)"
+        }
+        store.set(raw.sorted(), forKey: EventMonitor.dismissedKey)
+    }
 
-            // New session: require a live process before adding it.
-            guard alive, let pid = filePid else { continue }
-            let cwd = dict["cwd"] as? String ?? ""
-            let name = dict["name"] as? String ?? ""
-            // Look up TTY from the process so terminal focus works immediately
-            var tty = ""
-            let proc = Process()
-            proc.executableURL = URL(fileURLWithPath: "/bin/ps")
-            proc.arguments = ["-o", "tty=", "-p", String(pid)]
-            let pipe = Pipe()
-            proc.standardOutput = pipe
-            proc.standardError = FileHandle.nullDevice
-            if let _ = try? proc.run() {
-                proc.waitUntilExit()
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                let raw = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                if !raw.isEmpty && raw != "??" {
-                    tty = "/dev/\(raw)"
-                }
-            }
-            sessions[sid] = SessionInfo(
-                id: sid,
-                projectName: (cwd as NSString).lastPathComponent,
-                shortSession: String(sid.prefix(8)),
-                cwd: cwd,
-                tty: tty,
-                sessionName: name,
-                pid: pid_t(pid),
-                lastActivity: Date(),
-                claudeStatus: claudeStatus,
-                statusUpdatedAt: statusUpdatedAt
-            )
-            if let info = sessions[sid] {
-                enrichmentService?.refresh(for: info)
+    /// Look up a local process's controlling TTY so terminal focus works
+    /// immediately for newly discovered sessions.
+    private static func lookupTTY(pid: pid_t) -> String {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/ps")
+        proc.arguments = ["-o", "tty=", "-p", String(pid)]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = FileHandle.nullDevice
+        guard (try? proc.run()) != nil else { return "" }
+        proc.waitUntilExit()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let raw = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return (!raw.isEmpty && raw != "??") ? "/dev/\(raw)" : ""
+    }
+
+    // MARK: - Event ingestion (shared by the local file pipeline and remote origins)
+
+    /// Build a NaviEvent from an event-file dict. Missing fields get the same
+    /// defaults the file pipeline has always used.
+    public static func makeEvent(from dict: [String: Any], fallbackID: String, origin: String) -> NaviEvent {
+        NaviEvent(
+            id: dict["id"] as? String ?? fallbackID,
+            timestamp: Date(
+                timeIntervalSince1970: dict["timestamp"] as? Double
+                    ?? Date().timeIntervalSince1970),
+            type: dict["type"] as? String ?? "notification",
+            title: dict["title"] as? String ?? "Claude Code",
+            body: dict["body"] as? String ?? "",
+            description: dict["description"] as? String ?? "",
+            sessionID: dict["session_id"] as? String ?? "",
+            sessionName: dict["session_name"] as? String ?? "",
+            pid: pid_t(dict["pid"] as? Int ?? 0),
+            cwd: dict["cwd"] as? String ?? "",
+            tty: dict["tty"] as? String ?? "",
+            toolUseID: dict["tool_use_id"] as? String ?? "",
+            expires: (dict["expires"] as? Double).flatMap { $0 > 0 ? Date(timeIntervalSince1970: $0) : nil },
+            origin: origin
+        )
+    }
+
+    /// Main-thread handling of one new event. Matching against existing
+    /// events/sessions is always by (origin, sessionID).
+    private func receive(_ event: NaviEvent) {
+        updateSession(for: event)
+        let key = event.sessionKey
+        // Skip Notification events for sessions that already have a
+        // pending Permission — the permission itself signals "needs
+        // attention", so the notification would be redundant.
+        if event.type == "notification",
+           events.contains(where: { $0.sessionKey == key && $0.isPending }) {
+            return
+        }
+        // When a Stop event arrives, immediately dismiss pending
+        // permissions for this session — the turn ended, so any
+        // unresolved permission was denied/interrupted. Other
+        // non-permission events use a 30s age threshold.
+        // Info events are passive status cards — they don't affect pending permissions.
+        if event.type != "permission" && event.type != "info" {
+            let minAge: TimeInterval = event.type == "stop" ? 0 : 30
+            for i in events.indices where events[i].sessionKey == key && events[i].isPending && event.timestamp.timeIntervalSince(events[i].timestamp) > minAge {
+                events[i].resolved = true
+                events[i].response = "dismissed"
             }
         }
-        return liveSessionIDs
+        // Keep only the latest event per session (preserve pending permissions and
+        // sticky info cards). Info events are additive — they don't displace the
+        // current stop/notification card, and non-info events don't displace info cards.
+        if event.type != "info" {
+            events.removeAll { $0.sessionKey == key && !$0.isPending && $0.type != "info" }
+        }
+        // Stop events update session state and clear stale cards (above) but don't
+        // add a card themselves — the session header's Idle status covers it.
+        guard event.type != "stop" else { return }
+        events.insert(event, at: 0)
+    }
+
+    /// Resolve signal (PostToolUse auto-dismiss, or an explicit resolve for an
+    /// info card). Only matches events from the same origin.
+    private func applyResolve(_ dict: [String: Any], origin: String) {
+        let tuid = dict["tool_use_id"] as? String
+        let eid = dict["id"] as? String
+        DispatchQueue.main.async {
+            for i in self.events.indices where self.events[i].isPending && self.events[i].origin == origin {
+                if (tuid != nil && !tuid!.isEmpty && self.events[i].toolUseID == tuid) ||
+                   (eid != nil && self.events[i].id == eid) {
+                    self.events[i].resolved = true
+                    self.events[i].response = "dismissed"
+                }
+            }
+            // info cards are never isPending; resolve them by id directly.
+            if let eid = eid, !eid.isEmpty {
+                self.events.removeAll { $0.type == "info" && $0.id == eid && $0.origin == origin }
+            }
+        }
+    }
+
+    /// UserPromptSubmit signals: the session started a new turn.
+    private func applyWorking(_ keys: Set<SessionKey>) {
+        for key in keys {
+            // A new turn is new activity: let a dismissed session come back.
+            dismissed.removeValue(forKey: key)
+            if sessions[key] != nil {
+                sessions[key]!.finishedUnseen = false
+                sessions[key]!.lastEventType = "working"
+                sessions[key]!.lastActivity = Date()
+            }
+            // New turn — dismiss stale pending permissions
+            for i in events.indices where events[i].sessionKey == key && events[i].isPending {
+                events[i].resolved = true
+                events[i].response = "dismissed"
+            }
+        }
+    }
+
+    /// Apply per-origin liveness and clean up after pruned sessions.
+    private func reconcile(liveness: [String: OriginLiveness]) {
+        dismissed = SessionReconciler.pruneDismissed(dismissed, liveness: liveness)
+        var table = sessions
+        let result = SessionReconciler.prune(&table, liveness: liveness)
+        guard result.changed else { return }
+        sessions = table
+        guard !result.pruned.isEmpty else { return }
+        events.removeAll { !$0.isPending && result.pruned.contains($0.sessionKey) }
+        evictEnrichment(for: result.pruned)
+    }
+
+    /// Enrichment (git/transcript/PR probes) only ever runs for local sessions:
+    /// a remote session's cwd and transcript live on another machine.
+    private func evictEnrichment(for keys: some Sequence<SessionKey>) {
+        guard let svc = enrichmentService else { return }
+        for key in keys where key.isLocal { svc.evict(sessionID: key.sessionID) }
+        svc.evictUnused(activeCwds: Set(sessions.values.filter(\.isLocal).map(\.cwd)))
+    }
+
+    private func playSounds(for types: Set<String>) {
+        // Check each type independently
+        for type in types {
+            if let name = EventMonitor.soundName(for: type) {
+                NSSound(named: NSSound.Name(name))?.play()
+            }
+        }
+    }
+
+    /// Which system sound to play for an event type, or nil for none. Per-type
+    /// toggles live in Settings → Sounds (`NaviSound.<type>`); only permission
+    /// is on by default. Stop ("Finished") plays only when the user turned it
+    /// on — the turn ending (working → idle) is the moment it marks.
+    static func soundName(for type: String, defaults: UserDefaults = .standard) -> String? {
+        guard defaults.object(forKey: "NaviSound.\(type)") as? Bool ?? (type == "permission") else { return nil }
+        return defaults.string(forKey: "NaviSound.\(type).name") ?? "Glass"
     }
 
     private func updateSession(for event: NaviEvent) {
-        let sid = event.sessionID
-        guard !sid.isEmpty else { return }
+        guard !event.sessionID.isEmpty else { return }
+        let sid = event.sessionKey
+        // Any update brings a dismissed session back. Local event files can
+        // outlive a restart, so only ones written after the dismissal count;
+        // remote events arrive live (and are deduplicated by ID).
+        if let d = dismissed[sid], !event.origin.isEmpty || event.timestamp > d.at {
+            dismissed.removeValue(forKey: sid)
+        }
 
         if sessions[sid] == nil {
             // Don't create a phantom session entry for external info events —
@@ -353,15 +440,21 @@ public class EventMonitor: ObservableObject {
             // private plugin's SessionEnd hook).
             guard event.type != "info" else { return }
             sessions[sid] = SessionInfo(
-                id: sid,
+                id: event.sessionID,
                 projectName: event.projectName,
                 shortSession: event.shortSession,
                 cwd: event.cwd,
                 tty: event.tty,
-                sessionName: event.sessionName,
+                // Names come from the session registry (local discovery or
+                // remote heartbeat, see SessionReconciler.merge), which replaces
+                // this within a poll. Remote events may come from older hooks
+                // carrying placeholder ("derived") names, so start those blank.
+                sessionName: event.origin.isEmpty ? event.sessionName : "",
                 pid: event.pid,
-                lastActivity: event.timestamp
+                lastActivity: event.timestamp,
+                origin: event.origin
             )
+            if event.type == "stop" { sessions[sid]!.finishedUnseen = true }
         } else {
             sessions[sid]!.lastActivity = event.timestamp
             // Only Stop transitions to idle. Other events (notification,
@@ -369,6 +462,7 @@ public class EventMonitor: ObservableObject {
             // prevents mid-turn notifications from flipping to "Waiting".
             if event.type == "stop" {
                 sessions[sid]!.lastEventType = "stop"
+                sessions[sid]!.finishedUnseen = true
             }
             if event.pid > 0 {
                 sessions[sid]!.pid = event.pid
@@ -376,17 +470,100 @@ public class EventMonitor: ObservableObject {
             if !event.tty.isEmpty {
                 sessions[sid]!.tty = event.tty
             }
-            // Always update session name — it can change via /rename
-            sessions[sid]!.sessionName = event.sessionName
+            // Session names (incl. /rename) are refreshed from the session
+            // registry by SessionReconciler.merge, not from events.
         }
-        if let info = sessions[sid] {
+        if let info = sessions[sid], info.isLocal {
             enrichmentService?.refresh(for: info)
         }
     }
 
+    /// The user clicked the session: stop highlighting it as finished.
+    public func acknowledge(_ key: SessionKey) {
+        guard sessions[key]?.finishedUnseen == true else { return }
+        sessions[key]!.finishedUnseen = false
+    }
+
+    // MARK: - Remote origins
+
+    private static let remoteEventTypes: Set<String> = ["permission", "stop", "notification", "info"]
+
+    /// RemoteEventSink: one event file relayed from a remote host. Validated
+    /// more strictly than local files since it crossed a machine boundary.
+    public func ingestRemoteEvent(_ dict: [String: Any], origin: String) {
+        guard !origin.isEmpty,
+              let id = dict["id"] as? String,
+              id.count <= 128, id.range(of: #"^[A-Za-z0-9_-]+$"#, options: .regularExpression) != nil,
+              let type = dict["type"] as? String, EventMonitor.remoteEventTypes.contains(type)
+        else { return }
+        let sid = dict["session_id"] as? String ?? ""
+        guard sid.isEmpty || RemoteMessage.isValidSessionID(sid) else { return }
+        var clean = dict
+        clean["tty"] = ""  // a remote TTY means nothing on this Mac
+        let event = EventMonitor.makeEvent(from: clean, fallbackID: id, origin: origin)
+        DispatchQueue.main.async {
+            guard self.knownRemoteIDs.insert("\(origin)/\(id)").inserted else { return }
+            self.receive(event)
+            self.playSounds(for: [event.type])
+        }
+    }
+
+    public func ingestRemoteResolve(_ dict: [String: Any], origin: String) {
+        guard !origin.isEmpty else { return }
+        applyResolve(dict, origin: origin)
+    }
+
+    public func ingestRemoteWorking(sessionID: String, origin: String) {
+        guard !origin.isEmpty else { return }
+        DispatchQueue.main.async {
+            self.applyWorking([SessionKey(origin: origin, sessionID: sessionID)])
+        }
+    }
+
+    /// Heartbeat: merge the host's live sessions and record its liveness. The
+    /// next poll prunes remote sessions missing from `live`.
+    public func applyRemoteHeartbeat(origin: String, sessions discovered: [DiscoveredSession], live: Set<String>?) {
+        guard !origin.isEmpty else { return }
+        DispatchQueue.main.async {
+            SessionReconciler.wakeDismissed(&self.dismissed, discovered: discovered, origin: origin, trustClock: false)
+            SessionReconciler.merge(discovered, origin: origin, into: &self.sessions, skip: Set(self.dismissed.keys))
+            self.remoteLiveness[origin] = live.map { .live($0) } ?? .unknown
+        }
+    }
+
+    /// Record a remote origin's liveness. `.live` comes from a heartbeat,
+    /// `.disconnected` when its relay drops. Applied on the next poll.
+    public func setLiveness(origin: String, _ state: OriginLiveness) {
+        guard !origin.isEmpty else { return }  // local liveness is the PID scan
+        DispatchQueue.main.async { self.remoteLiveness[origin] = state }
+    }
+
+    /// Forget a remote origin entirely (host removed from settings or the
+    /// feature turned off): drop its sessions and non-pending events.
+    public func removeOrigin(_ origin: String) {
+        guard !origin.isEmpty else { return }
+        DispatchQueue.main.async {
+            self.remoteLiveness.removeValue(forKey: origin)
+            self.dismissed = self.dismissed.filter { $0.key.origin != origin }
+            self.events.removeAll { $0.origin == origin }
+            self.sessions = self.sessions.filter { $0.key.origin != origin }
+        }
+    }
+
     public func respond(to id: String, with response: String) {
-        try? response.write(
-            toFile: "\(responsesDir)/\(id)", atomically: true, encoding: .utf8)
+        // Called from the UI on the main thread.
+        if let event = events.first(where: { $0.id == id }), !event.origin.isEmpty {
+            // Remote card: the decision goes back over that host's relay. If it
+            // can't be delivered (host disconnected), leave the buttons live;
+            // the remote hook falls back to the terminal prompt on timeout.
+            guard remoteResponder?.respond(origin: event.origin, id: id, decision: response) == true else {
+                naviLog("remote respond failed for %@ on %@", id, event.origin)
+                return
+            }
+        } else {
+            try? response.write(
+                toFile: "\(responsesDir)/\(id)", atomically: true, encoding: .utf8)
+        }
         DispatchQueue.main.async {
             if let idx = self.events.firstIndex(where: { $0.id == id }) {
                 self.events[idx].resolved = true
@@ -401,19 +578,63 @@ public class EventMonitor: ObservableObject {
         }
     }
 
-    public func dismissSession(_ sessionID: String) {
+    /// A dismissal recording the status the session had when hidden, so a
+    /// later change in the registry is recognised as an update.
+    static func dismissal(of info: SessionInfo?, now: Date = Date()) -> SessionReconciler.Dismissal {
+        guard let info else { return .init(at: now) }
+        let name = info.displayName(useSessionName: true)
+            .split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        // No registry status yet (known only from events): let the first
+        // sighting set the baseline instead of counting as a change.
+        guard !info.claudeStatus.isEmpty || info.statusUpdatedAt != nil else {
+            return .init(at: now, name: name, snapshot: info)
+        }
+        return .init(at: now, baseline: .init(status: info.claudeStatus, updatedAt: info.statusUpdatedAt),
+                     name: name, snapshot: info)
+    }
+
+    /// Sessions hidden with ✕, most recently hidden first.
+    public var hiddenSessions: [HiddenSession] {
+        dismissed.map { HiddenSession(key: $0.key, name: $0.value.name, hiddenAt: $0.value.at) }
+            .sorted { $0.hiddenAt != $1.hiddenAt ? $0.hiddenAt > $1.hiddenAt : $0.key.id < $1.key.id }
+    }
+
+    /// Show a hidden session again. Its saved row comes back at once when
+    /// known; otherwise the next discovery poll or heartbeat re-adds it.
+    public func unhide(_ key: SessionKey) {
+        DispatchQueue.main.async { [weak self] in self?.applyUnhide([key]) }
+    }
+
+    public func unhideAll() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.applyUnhide(Array(self.dismissed.keys))
+        }
+    }
+
+    private func applyUnhide(_ keys: [SessionKey]) {
+        for key in keys {
+            guard let d = dismissed.removeValue(forKey: key) else { continue }
+            if sessions[key] == nil, var info = d.snapshot {
+                info.finishedUnseen = false
+                sessions[key] = info
+                if info.isLocal { enrichmentService?.refresh(for: info) }
+            }
+        }
+    }
+
+    public func dismissSession(_ key: SessionKey) {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
-            self.events.removeAll { $0.sessionID == sessionID && !$0.isPending }
-            self.sessions.removeValue(forKey: sessionID)
+            self.events.removeAll { $0.sessionKey == key && !$0.isPending }
+            let info = self.sessions.removeValue(forKey: key)
+            // Keep it hidden until it does something new (see `dismissed`).
+            self.dismissed[key] = EventMonitor.dismissal(of: info)
             // Tell the enrichment service to drop caches for this sid and any
             // cwds no longer referenced. Without this, gitCache /
             // transcriptCache / prCache (and their @Published mirrors) grow
             // unbounded over Navi's lifetime.
-            if let svc = self.enrichmentService {
-                svc.evict(sessionID: sessionID)
-                svc.evictUnused(activeCwds: Set(self.sessions.values.map(\.cwd)))
-            }
+            self.evictEnrichment(for: [key])
         }
     }
 
@@ -432,15 +653,11 @@ public class EventMonitor: ObservableObject {
     public func clearAll() {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
-            let dismissedSids = Array(self.sessions.keys)
+            let dismissed = Array(self.sessions.keys)
             self.events.removeAll { !$0.isPending }
+            for (key, info) in self.sessions { self.dismissed[key] = EventMonitor.dismissal(of: info) }
             self.sessions.removeAll()
-            if let svc = self.enrichmentService {
-                for sid in dismissedSids {
-                    svc.evict(sessionID: sid)
-                }
-                svc.evictUnused(activeCwds: [])
-            }
+            self.evictEnrichment(for: dismissed)
         }
     }
 }
