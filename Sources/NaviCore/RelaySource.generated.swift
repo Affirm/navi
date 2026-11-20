@@ -51,6 +51,7 @@ RELAY_VERSION = 1
 MIRRORABLE_FEATURES = ("auto-dismiss", "session-status", "session-names")
 
 EVENT_ID_RE = re.compile(r"^[0-9]{1,20}-[0-9a-f]{32}$")
+BRIDGE_ID_RE = re.compile(r"^(?:session|cse)_[A-Za-z0-9_-]{1,100}$")
 DECISIONS = ("approve", "deny")
 MAX_EVENT_BYTES = 1024 * 1024
 STALE_EVENT_SECONDS = 120
@@ -300,6 +301,11 @@ def scan_sessions(sessions_dir, is_claude=looks_like_claude, titles=None):
         derived = entry.pop("name", "") if d.get("nameSource") == "derived" else ""
         if isinstance(d.get("updatedAt"), (int, float)):
             entry["updatedAt"] = d["updatedAt"]
+        # Remote Control session (claude.ai/code): lets Navi open it in the
+        # Claude app on the Mac.
+        bridge = d.get("bridgeSessionId")
+        if isinstance(bridge, str) and BRIDGE_ID_RE.match(bridge):
+            entry["bridgeSessionId"] = bridge
         title = titles.title(sid, entry.get("cwd", "")) if titles is not None else ""
         title = title or derived
         if title:

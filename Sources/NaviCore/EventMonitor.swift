@@ -231,7 +231,8 @@ public class EventMonitor: ObservableObject, RemoteEventSink {
             discovered.append(DiscoveredSession(
                 sessionID: parsed.sessionID, pid: parsed.pid, alive: parsed.alive, cwd: parsed.cwd,
                 name: parsed.name, claudeStatus: parsed.claudeStatus,
-                statusUpdatedAt: parsed.statusUpdatedAt, title: title))
+                statusUpdatedAt: parsed.statusUpdatedAt, title: title,
+                remoteControlID: parsed.remoteControlID))
         }
         localTitles.forget(except: Set(discovered.filter(\.alive).map(\.sessionID)))
         SessionReconciler.wakeDismissed(&dismissed, discovered: discovered, origin: "", trustClock: true)

@@ -166,6 +166,16 @@ class RelayTests(unittest.TestCase):
         live = relay.scan_sessions(self.sessions, is_claude=lambda pid: True)
         self.assertEqual([s["sessionId"] for s in live], ["ghost"])
 
+    def test_heartbeat_carries_valid_bridge_session_id_only(self):
+        relay = self._relay_module()
+        for i, bridge in enumerate(["session_01AbC-x_9", "../evil", 7]):
+            with open(os.path.join(self.sessions, "%d.json" % i), "w") as f:
+                json.dump({"sessionId": "s%d" % i, "pid": os.getpid(), "bridgeSessionId": bridge}, f)
+        live = {e["sessionId"]: e for e in relay.scan_sessions(self.sessions, is_claude=lambda p: True)}
+        self.assertEqual(live["s0"].get("bridgeSessionId"), "session_01AbC-x_9")
+        self.assertNotIn("bridgeSessionId", live["s1"])
+        self.assertNotIn("bridgeSessionId", live["s2"])
+
     def _relay_module(self):
         import importlib.util
         spec = importlib.util.spec_from_file_location("navi_relay_titles", RELAY)

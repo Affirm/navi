@@ -6,6 +6,8 @@ import Foundation
 ///   keeps one JSON file per Code session (`local_<id>.json`) whose
 ///   `cliSessionId` is the Claude Code session ID Navi sees, for local and
 ///   SSH sessions alike.
+/// - Remote Control sessions (`bridgeSessionId` in Claude Code's registry,
+///   relayed for remote hosts): `claude://code/session_…`.
 /// - VS Code extension: `vscode://anthropic.claude-code/open?session=<id>`
 ///   (local sessions whose registry entry says `entrypoint: claude-vscode`).
 ///
@@ -26,6 +28,11 @@ public enum ConversationLink {
         }
         if session.isLocal, entrypoint(sessionID: session.id, pid: session.pid, in: registryDir) == "claude-vscode" {
             return vscodeURL(session.id)
+        }
+        // Remote Control: the Claude app opens claude.ai/code sessions by ID,
+        // which covers sessions on remote hosts.
+        if DiscoveredSession.isValidRemoteControlID(session.remoteControlID) {
+            return URL(string: "claude://code/\(session.remoteControlID)")
         }
         return nil
     }

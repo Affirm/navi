@@ -25,10 +25,12 @@ public struct DiscoveredSession: Equatable {
     public let statusUpdatedAt: Date?
     /// Conversation title from the transcript (remote heartbeats only).
     public let title: String
+    /// Remote Control session ID (`session_…`/`cse_…`), "" when not shared.
+    public let remoteControlID: String
 
     public init(sessionID: String, pid: pid_t?, alive: Bool, cwd: String = "",
                 name: String = "", claudeStatus: String = "", statusUpdatedAt: Date? = nil,
-                title: String = "") {
+                title: String = "", remoteControlID: String = "") {
         self.sessionID = sessionID
         self.pid = pid
         self.alive = alive
@@ -37,6 +39,13 @@ public struct DiscoveredSession: Equatable {
         self.claudeStatus = claudeStatus
         self.statusUpdatedAt = statusUpdatedAt
         self.title = String(title.prefix(200))
+        self.remoteControlID = DiscoveredSession.isValidRemoteControlID(remoteControlID) ? remoteControlID : ""
+    }
+
+    static let remoteControlPattern = try! NSRegularExpression(pattern: "^(?:session|cse)_[A-Za-z0-9_-]{1,100}$")
+
+    public static func isValidRemoteControlID(_ s: String) -> Bool {
+        remoteControlPattern.firstMatch(in: s, range: NSRange(s.startIndex..., in: s)) != nil
     }
 
     /// Parse a session registry dict (`sessionId`, `pid`, `cwd`, `name`,
@@ -54,7 +63,8 @@ public struct DiscoveredSession: Equatable {
             name: dict["nameSource"] as? String == "derived" ? "" : dict["name"] as? String ?? "",
             claudeStatus: dict["status"] as? String ?? "",
             statusUpdatedAt: parseUpdatedAt(dict["updatedAt"]),
-            title: dict["title"] as? String ?? ""
+            title: dict["title"] as? String ?? "",
+            remoteControlID: dict["bridgeSessionId"] as? String ?? ""
         )
     }
 
@@ -103,6 +113,7 @@ public enum SessionReconciler {
                 // The registry (session file / heartbeat) is the authority for
                 // the name, so /rename shows up and placeholder names don't.
                 sessions[key]!.sessionName = d.name
+                sessions[key]!.remoteControlID = d.remoteControlID
                 if d.alive, let pid = d.pid, sessions[key]!.pid != pid {
                     sessions[key]!.pid = pid
                 }
@@ -123,6 +134,7 @@ public enum SessionReconciler {
                 origin: origin,
                 title: d.title
             )
+            sessions[key]!.remoteControlID = d.remoteControlID
             added.append(key)
         }
         return added

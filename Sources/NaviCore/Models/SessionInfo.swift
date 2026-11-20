@@ -29,6 +29,9 @@ public struct SessionInfo: Identifiable {
     /// Conversation title (custom or AI-generated) read from the transcript.
     /// Remote sessions only; shown when there's no session name.
     public var title: String = ""
+    /// Remote Control session ID (`session_…`), set when the session is
+    /// shared to claude.ai/code; the Claude app can open it from any machine.
+    public var remoteControlID: String = ""
 
     public init(
         id: String,

@@ -120,7 +120,8 @@ public enum RemoteMessage {
                     sessionID: d.sessionID, pid: d.pid,
                     alive: live?.contains(d.sessionID) ?? false,
                     cwd: d.cwd, name: d.name, claudeStatus: d.claudeStatus,
-                    statusUpdatedAt: d.statusUpdatedAt, title: d.title)
+                    statusUpdatedAt: d.statusUpdatedAt, title: d.title,
+                    remoteControlID: d.remoteControlID)
             }
             return .heartbeat(live: live, sessions: sessions,
                               user: obj["user"] as? String ?? "",

@@ -44,6 +44,25 @@ struct ConversationLinkTests {
                                      registryDir: reg.path) == nil)
     }
 
+    @Test func remoteControlSessionsOpenByBridgeID() throws {
+        let desk = tempDir(), reg = tempDir()
+        defer { try? FileManager.default.removeItem(at: desk); try? FileManager.default.removeItem(at: reg) }
+        var remote = info("r", origin: "ops")
+        remote.remoteControlID = "session_01AuM4A8k5d4"
+        #expect(ConversationLink.url(for: remote, desktopDir: desk.path, registryDir: reg.path)?
+            .absoluteString == "claude://code/session_01AuM4A8k5d4")
+        remote.remoteControlID = "session_x/../y"
+        #expect(ConversationLink.url(for: remote, desktopDir: desk.path, registryDir: reg.path) == nil)
+    }
+
+    @Test func heartbeatPassesBridgeIDThrough() {
+        let line = #"{"kind":"heartbeat","live":["s"],"sessions":[{"sessionId":"s","pid":1,"bridgeSessionId":"session_01Ab"}]}"#
+        guard case .heartbeat(_, let sessions, _, _)? = RemoteMessage.parse(Data(line.utf8)) else {
+            Issue.record("not a heartbeat"); return
+        }
+        #expect(sessions.first?.remoteControlID == "session_01Ab")
+    }
+
     @Test func terminalSessionsHaveNoLink() throws {
         let desk = tempDir(), reg = tempDir()
         defer { try? FileManager.default.removeItem(at: desk); try? FileManager.default.removeItem(at: reg) }
